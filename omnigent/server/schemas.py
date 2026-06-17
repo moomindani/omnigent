@@ -3348,6 +3348,7 @@ ServerStreamEvent = Annotated[
     SessionStatusEvent
     | SessionUsageEvent
     | SessionModelEvent
+    | SessionModeEvent
     | SessionAgentChangedEvent
     | SessionTodosEvent
     | SessionTerminalPendingEvent
