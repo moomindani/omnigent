@@ -29,13 +29,17 @@ sys_call_async". The auto-delivered result must render as a dim
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import httpx
 import pytest
 
-from tests.e2e.conftest import upload_agent
+from tests.e2e.conftest import (
+    create_runner_bound_session,
+    poll_session_until_terminal,
+    send_user_message_to_session,
+    upload_agent,
+)
 
 _ASYNC_TOOLS_FIXTURE_DIR = (
     Path(__file__).resolve().parents[1] / "_fixtures" / "agents" / "async-tools-test"
@@ -70,44 +74,37 @@ def _create_response_blocking(
     http_client: httpx.Client,
     *,
     model: str,
+    runner_id: str,
     user_text: str,
     timeout_s: float = 180.0,
 ) -> dict:
     """
-    POST a response, poll until terminal, return the final body.
+    POST a session event, poll until terminal, return the final response-like body.
 
     :param http_client: HTTP client pointed at the live server.
     :param model: Agent name to invoke.
+    :param runner_id: Registered runner id from ``live_runner_id``.
     :param user_text: Plain-text input message for the agent.
     :param timeout_s: Max seconds to wait for the response to
         complete. Default 180 s — async tools sleep 2 s and the
         LLM may take a couple of turns to converge.
     :returns: The final response JSON.
     """
-    resp = http_client.post(
-        "/v1/responses",
-        json={
-            "model": model,
-            "input": user_text,
-            "background": True,
-            "store": True,
-        },
+    session_id = create_runner_bound_session(
+        http_client,
+        agent_name=model,
+        runner_id=runner_id,
     )
-    resp.raise_for_status()
-    body = resp.json()
-    response_id = body["id"]
-
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        get_resp = http_client.get(f"/v1/responses/{response_id}")
-        get_resp.raise_for_status()
-        body = get_resp.json()
-        if body["status"] in ("completed", "failed", "cancelled"):
-            return body
-        time.sleep(1.0)
-    raise AssertionError(
-        f"Response {response_id} did not complete within {timeout_s}s; "
-        f"final status was {body.get('status')!r}."
+    response_id = send_user_message_to_session(
+        http_client,
+        session_id=session_id,
+        content=user_text,
+    )
+    return poll_session_until_terminal(
+        http_client,
+        session_id=session_id,
+        response_id=response_id,
+        timeout=timeout_s,
     )
 
 
@@ -158,6 +155,7 @@ def _conversation_items(http_client: httpx.Client, conversation_id: str) -> list
 def test_async_tool_real_llm_e2e(
     http_client: httpx.Client,
     async_tools_agent: str,
+    live_runner_id: str,
 ) -> None:
     """
     Real LLM dispatches an async tool, sees the auto-delivered
@@ -173,6 +171,7 @@ def test_async_tool_real_llm_e2e(
     body = _create_response_blocking(
         http_client,
         model=async_tools_agent,
+        runner_id=live_runner_id,
         user_text=(
             "Dispatch delayed_echo with label='alpha' via "
             "sys_call_async. After it completes, tell me the "
@@ -218,6 +217,7 @@ def test_async_tool_real_llm_e2e(
 def test_mixed_sync_and_async_tools_e2e(
     http_client: httpx.Client,
     async_tools_agent: str,
+    live_runner_id: str,
 ) -> None:
     """
     The same turn dispatches both an async tool and a sync tool.
@@ -231,6 +231,7 @@ def test_mixed_sync_and_async_tools_e2e(
     body = _create_response_blocking(
         http_client,
         model=async_tools_agent,
+        runner_id=live_runner_id,
         user_text=(
             "Run TWO tools in this turn: count_chars on the text "
             "'hello' (which is 5 characters) — call it directly "
@@ -260,6 +261,7 @@ def test_mixed_sync_and_async_tools_e2e(
 def test_async_tool_failure_surfaces_e2e(
     http_client: httpx.Client,
     async_tools_agent: str,
+    live_runner_id: str,
 ) -> None:
     """
     Real LLM invokes the failing async tool, sees the failure
@@ -272,6 +274,7 @@ def test_async_tool_failure_surfaces_e2e(
     body = _create_response_blocking(
         http_client,
         model=async_tools_agent,
+        runner_id=live_runner_id,
         user_text=(
             "Dispatch boom_async via sys_call_async. Then tell me "
             "what happened — include the literal error marker "

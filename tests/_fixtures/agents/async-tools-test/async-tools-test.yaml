@@ -6,6 +6,8 @@ description: |
   dispatches the slow tools via ``sys_call_async`` to drive
   dispatch / drain / failure / mixed scenarios.
 
+async: true
+
 executor:
   model: gpt-5.4
 

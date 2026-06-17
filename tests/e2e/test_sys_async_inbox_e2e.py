@@ -43,12 +43,16 @@ from __future__ import annotations
 
 import tarfile
 import tempfile
-import time
 from pathlib import Path
 
 import httpx
 import pytest
 
+from tests.e2e.conftest import (
+    create_runner_bound_session,
+    poll_session_until_terminal,
+    send_user_message_to_session,
+)
 from tests.e2e.helpers import final_assistant_text, get_output_items
 
 _FIXTURE_DIR = (
@@ -99,14 +103,16 @@ def _create_response_blocking(
     http_client: httpx.Client,
     *,
     model: str,
+    runner_id: str,
     user_text: str,
     timeout_s: float = 240.0,
 ) -> dict:
     """
-    POST a response, poll until terminal, return the final body.
+    POST a session event, poll until terminal, return the final response-like body.
 
     :param http_client: HTTP client pointed at the live server.
     :param model: Agent name to invoke.
+    :param runner_id: Registered runner id from ``live_runner_id``.
     :param user_text: Plain-text input message for the agent.
     :param timeout_s: Max seconds to wait for the response to
         complete. Default 240 s — the LLM may take 2-3 turns
@@ -114,30 +120,21 @@ def _create_response_blocking(
         the tool itself sleeps 2 s.
     :returns: The final response JSON.
     """
-    resp = http_client.post(
-        "/v1/responses",
-        json={
-            "model": model,
-            "input": user_text,
-            "background": True,
-            "store": True,
-        },
+    session_id = create_runner_bound_session(
+        http_client,
+        agent_name=model,
+        runner_id=runner_id,
     )
-    resp.raise_for_status()
-    body = resp.json()
-    response_id = body["id"]
-
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        get_resp = http_client.get(f"/v1/responses/{response_id}")
-        get_resp.raise_for_status()
-        body = get_resp.json()
-        if body["status"] in ("completed", "failed", "cancelled"):
-            return body
-        time.sleep(1.0)
-    raise AssertionError(
-        f"Response {response_id} did not complete within {timeout_s}s; "
-        f"final status was {body.get('status')!r}."
+    response_id = send_user_message_to_session(
+        http_client,
+        session_id=session_id,
+        content=user_text,
+    )
+    return poll_session_until_terminal(
+        http_client,
+        session_id=session_id,
+        response_id=response_id,
+        timeout=timeout_s,
     )
 
 
@@ -178,6 +175,7 @@ def _function_call_outputs_for(response_body: dict, call_ids: set[str]) -> list[
 def test_sys_call_async_dispatch_marker_reaches_llm_e2e(
     http_client: httpx.Client,
     sys_async_inbox_agent: str,
+    live_runner_id: str,
 ) -> None:
     """
     The LLM dispatches a tool via ``sys_call_async`` and the
@@ -217,6 +215,7 @@ def test_sys_call_async_dispatch_marker_reaches_llm_e2e(
     body = _create_response_blocking(
         http_client,
         model=sys_async_inbox_agent,
+        runner_id=live_runner_id,
         user_text=(
             "Dispatch the tag_label tool with label='gamma' using "
             "sys_call_async. After it completes, tell me the "
@@ -284,6 +283,7 @@ def test_sys_call_async_dispatch_marker_reaches_llm_e2e(
 def test_sys_read_inbox_str_branch_routes_without_crash_e2e(
     http_client: httpx.Client,
     sys_async_inbox_agent: str,
+    live_runner_id: str,
 ) -> None:
     """
     Calling ``sys_read_inbox`` round-trips through the ``str``
@@ -307,6 +307,7 @@ def test_sys_read_inbox_str_branch_routes_without_crash_e2e(
     body = _create_response_blocking(
         http_client,
         model=sys_async_inbox_agent,
+        runner_id=live_runner_id,
         user_text=("Call sys_read_inbox right now and tell me what it returned, exactly."),
     )
     assert body["status"] == "completed", (
@@ -341,6 +342,7 @@ def test_sys_read_inbox_str_branch_routes_without_crash_e2e(
 def test_sys_cancel_async_aborts_in_flight_dispatch_e2e(
     http_client: httpx.Client,
     sys_async_inbox_agent: str,
+    live_runner_id: str,
 ) -> None:
     """
     The LLM dispatches a slow tool, cancels it via
@@ -376,6 +378,7 @@ def test_sys_cancel_async_aborts_in_flight_dispatch_e2e(
     body = _create_response_blocking(
         http_client,
         model=sys_async_inbox_agent,
+        runner_id=live_runner_id,
         user_text=(
             "Step 1: dispatch sleep_label with label='delta' and "
             "seconds=8 via sys_call_async. Step 2: as soon as you "
