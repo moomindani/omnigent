@@ -1288,6 +1288,67 @@ def test_evaluate_policy_stamps_live_model_from_context_json(
     assert context["harness"] == "claude-native"
 
 
+def test_evaluate_policy_stamps_permission_mode_from_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The hook stamps the payload's ``permission_mode`` onto the request context.
+
+    Claude Code carries the live permission mode (reflecting an in-pane
+    shift+tab cycle) on every PreToolUse / PostToolUse / UserPromptSubmit hook.
+    The hook must forward it under ``event.context.permission_mode`` so the
+    server can mirror it onto the session and broadcast a ``session.mode``
+    event — the only continuous, read-back channel for the mode.
+    """
+    posted: dict[str, object] = {}
+
+    class _FakeHttpxClient:
+        """Sync HTTP client stub capturing the posted EvaluationRequest."""
+
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            """Record constructor inputs. :returns: None."""
+            del headers, timeout
+
+        def __enter__(self) -> _FakeHttpxClient:
+            """:returns: This fake client."""
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            """:returns: None."""
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> object:
+            """Record the request and return an ALLOW verdict. :returns: response."""
+            import httpx
+
+            posted["json"] = json
+            return httpx.Response(
+                200,
+                text='{"result":"POLICY_ACTION_ALLOW"}',
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
+    payload = {
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "hello",
+        "permission_mode": "acceptEdits",
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
+
+    assert exit_code == 0
+    context = posted["json"]["event"]["context"]
+    assert context["permission_mode"] == "acceptEdits"
+
+
 def test_evaluate_policy_post_tool_use_converts_and_returns_context(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

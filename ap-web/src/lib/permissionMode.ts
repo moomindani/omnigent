@@ -1,3 +1,19 @@
+/**
+ * Internal session label that mirrors the last-known Claude Code permission
+ * mode for a claude-native session. The server stamps it from the
+ * ``permission_mode`` field on every UserPromptSubmit / PreToolUse /
+ * PostToolUse hook (see ``_observe_native_permission_mode``), so it survives
+ * reconnect and seeds the badge before the first live ``session.mode`` event.
+ */
+const CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY = "omnigent.claude_native.permission_mode";
+
+/** Read the persisted permission mode off a session snapshot's labels. */
+export function permissionModeFromSession(
+  source: { labels?: Record<string, string | null> | null } | null | undefined,
+): string | null {
+  return source?.labels?.[CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] ?? null;
+}
+
 /** Label + Tailwind color classes for a permission-mode badge. Null means: don't render. */
 export interface PermissionModeMeta {
   label: string;

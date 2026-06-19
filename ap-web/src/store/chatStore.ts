@@ -95,6 +95,7 @@ import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { isClaudeNativeModel } from "@/lib/claudeNativeModels";
 import { isCodexNativeModel } from "@/lib/codexNativeModels";
 import { codexPlanModeFromSession } from "@/lib/codexPlanMode";
+import { permissionModeFromSession } from "@/lib/permissionMode";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { isNativeWrapper } from "@/lib/nativeCodingAgents";
 
@@ -1612,6 +1613,7 @@ function sessionBindingPatch(
   | "sessionHarness"
   | "costControlModeOverride"
   | "codexPlanMode"
+  | "permissionMode"
   | "contextWindow"
   | "gitBranch"
   | "skills"
@@ -1629,6 +1631,10 @@ function sessionBindingPatch(
     sessionHarness: session.harness ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
     codexPlanMode: codexPlanModeFromSession(session),
+    // Seed the permission-mode badge from the persisted label so it survives
+    // reconnect (no session.mode replay) and shows the last-known mode before
+    // the next prompt re-observes it live.
+    permissionMode: permissionModeFromSession(session),
     contextWindow: session.contextWindow ?? null,
     gitBranch: session.gitBranch ?? null,
     skills: session.skills ?? [],

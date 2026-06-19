@@ -459,6 +459,76 @@ def _publish_collaboration_mode(session_id: str, mode: str) -> None:
     session_stream.publish(session_id, event.model_dump())
 
 
+# Last-known Claude Code permission mode (``"default"`` / ``"plan"`` /
+# ``"acceptEdits"`` / ``"auto"`` / ``"bypassPermissions"``) for a
+# claude-native session. Mirrored from the ``permission_mode`` field that
+# rides on every UserPromptSubmit / PreToolUse / PostToolUse hook payload
+# (and the PermissionRequest hook), so the web badge tracks in-pane shift+tab
+# cycles — which fire no other server signal — as of the last interaction.
+_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY = "omnigent.claude_native.permission_mode"
+
+
+def _publish_permission_mode(session_id: str, mode: str) -> None:
+    """
+    Publish the live Claude Code permission mode for a session.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param mode: The active permission-mode string, e.g. ``"default"``,
+        ``"plan"``, ``"acceptEdits"``, ``"auto"``, or ``"bypassPermissions"``.
+    :returns: None.
+    """
+    event = SessionModeEvent(
+        type="session.mode",
+        conversation_id=session_id,
+        mode=mode,
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
+async def _observe_native_permission_mode(
+    session_id: str,
+    conv: Conversation | None,
+    observed_mode: object,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Persist and broadcast an observed claude-native permission mode.
+
+    Claude Code has no read-back RPC and emits no event when the user
+    cycles the mode with shift+tab in the terminal. The mode does, however,
+    ride on the ``permission_mode`` field of every UserPromptSubmit /
+    PreToolUse / PostToolUse hook payload, so observing it on each hook makes
+    the web badge eventually-consistent: it corrects to the true mode as of
+    the next prompt or tool call. The label is the dedupe baseline so an
+    unchanged mode emits nothing.
+
+    No-op when ``observed_mode`` is not a non-empty string or already matches
+    the persisted label.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param conv: Conversation row read at the route boundary; its label is the
+        dedupe baseline. ``None`` skips the dedupe and always writes.
+    :param observed_mode: Permission mode from the hook payload; ignored
+        unless a non-empty string.
+    :param conversation_store: Store used to upsert the mode label.
+    :returns: None.
+    """
+    if not isinstance(observed_mode, str) or not observed_mode:
+        return
+    current = None
+    if conv is not None:
+        current = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+    if current == observed_mode:
+        return
+    await asyncio.to_thread(
+        conversation_store.set_labels,
+        session_id,
+        {_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY: observed_mode},
+    )
+    _publish_permission_mode(session_id, observed_mode)
+
+
 # Display name fallback when neither nickname nor role is available.
 _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
 # Labels read by ``_get_session_snapshot`` to seed the ap-web ring on
@@ -14089,12 +14159,15 @@ def create_sessions_router(
         if set_mode_entries:
             new_mode = set_mode_entries[0].get("mode")
             if isinstance(new_mode, str) and new_mode:
-                mode_event = SessionModeEvent(
-                    type="session.mode",
-                    conversation_id=session_id,
-                    mode=new_mode,
+                # Persist alongside the broadcast so the next observed hook
+                # (which now carries this same mode) dedupes against the
+                # label instead of re-emitting it.
+                await asyncio.to_thread(
+                    conversation_store.set_labels,
+                    session_id,
+                    {_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY: new_mode},
                 )
-                session_stream.publish(session_id, mode_event.model_dump())
+                _publish_permission_mode(session_id, new_mode)
         body = {
             "hookSpecificOutput": {
                 "hookEventName": "PermissionRequest",
@@ -14200,6 +14273,20 @@ def create_sessions_router(
             raise OmnigentError(
                 f"Session {session_id!r} not found.",
                 code=ErrorCode.NOT_FOUND,
+            )
+        # Mirror the permission mode carried on this hook (UserPromptSubmit /
+        # PreToolUse / PostToolUse) onto the session so the web badge tracks
+        # in-pane shift+tab cycles. Done before any early return below so the
+        # mode is observed on every hook, even ones whose policy verdict is a
+        # pass-through (web-prompt dedup, no-agent). The native hook stamps it
+        # under ``event.context.permission_mode``; absent for non-native callers.
+        _eval_context = event.get("context")
+        if isinstance(_eval_context, dict):
+            await _observe_native_permission_mode(
+                session_id,
+                conv,
+                _eval_context.get("permission_mode"),
+                conversation_store,
             )
         # Dedup the native request-phase gate. A native session's
         # ``UserPromptSubmit`` hook posts ``PHASE_REQUEST`` here for *every*

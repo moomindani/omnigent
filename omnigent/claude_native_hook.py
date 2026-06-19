@@ -799,6 +799,17 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     status_model = read_claude_status_model(bridge_dir)
     if status_model:
         context["model"] = status_model
+    # Stamp the live permission mode carried on every UserPromptSubmit /
+    # PreToolUse / PostToolUse hook payload. Claude Code reports the mode
+    # currently in effect — including after an in-pane shift+tab cycle that
+    # fires no other server signal — so the server can mirror it onto the
+    # session and broadcast a ``session.mode`` event when it changes (see
+    # ``_observe_native_permission_mode``). This is the only continuous,
+    # read-back channel for the mode; ``PermissionRequest`` alone only fires
+    # when a tool needs consent.
+    permission_mode = payload.get("permission_mode")
+    if isinstance(permission_mode, str) and permission_mode:
+        context["permission_mode"] = permission_mode
 
     url = f"{ap_server_url.rstrip('/')}/v1/sessions/{url_component(session_id)}/policies/evaluate"
     try:
