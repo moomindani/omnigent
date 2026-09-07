@@ -45,6 +45,17 @@ def _turn_body() -> dict[str, Any]:
     }
 
 
+def _lazy_turn_body() -> dict[str, Any]:
+    """A streaming turn that resolves the spec only when a tool call needs it.
+
+    Without the MCP hint the eager fill is skipped entirely, so the first
+    resolution of the shared cache happens mid-stream, in the lazy path.
+    """
+    body = _turn_body()
+    del body["has_mcp_servers"]
+    return body
+
+
 @pytest.mark.asyncio
 async def test_agent_cache_reset_is_not_undone_by_an_in_flight_resolution() -> None:
     """A resolution that raced a reset must not re-populate either spec cache."""
@@ -173,4 +184,79 @@ async def test_shared_agent_cache_reset_is_not_undone_by_an_in_flight_resolution
     assert caches["agent"].get(_AGENT_ID) is not superseded, (
         "the resolution that raced the reset re-installed the superseded bundle "
         "in the shared agent cache"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lazy_agent_cache_fill_is_not_undone_by_an_in_flight_resolution() -> None:
+    """The dispatch-time fill of the shared cache must be fenced as well.
+
+    The eager fill runs only for a turn that declares MCP servers. A streaming
+    turn without that hint resolves nothing up front: the shared cache is
+    written when a tool call arrives and has to be classified, and that is the
+    other unguarded write after an await.
+    """
+    entered_resolver = asyncio.Event()
+    release_resolver = asyncio.Event()
+    superseded = AgentSpec(spec_version=1, name="before-reset")
+    resolutions = 0
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Race the reset from the lazy path, the turn's only resolution."""
+        del agent_id, session_id
+        nonlocal resolutions
+        resolutions += 1
+        entered_resolver.set()
+        await release_resolver.wait()
+        return superseded
+
+    harness_client = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            # A runner builtin: classifying it for local dispatch is what pulls
+            # the spec in, so the fill happens mid-stream.
+            _sse(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "status": "action_required",
+                        "name": "sys_os_read",
+                        "call_id": "call_1",
+                        "arguments": "{}",
+                    },
+                }
+            ),
+        ]
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    caches = app.state.spec_caches
+
+    async with _runner_client(app) as client:
+        turn = asyncio.create_task(
+            client.post(f"/v1/sessions/{_CONV}/events?stream=true", json=_lazy_turn_body())
+        )
+        await asyncio.wait_for(entered_resolver.wait(), timeout=5)
+
+        reset = await client.post(
+            f"/v1/sessions/{_CONV}/agent-cache/reset",
+            json={"agent_id": _AGENT_ID},
+        )
+        assert reset.status_code == 200
+
+        # Let the raced resolution finish and attempt its now-stale write.
+        release_resolver.set()
+        assert (await asyncio.wait_for(turn, timeout=5)).status_code == 200
+
+    assert resolutions == 1, (
+        "the streaming turn no longer resolves the spec exactly once, so the "
+        "raced write may not be the lazy path's -- re-derive the setup"
+    )
+    assert caches["agent"].get(_AGENT_ID) is not superseded, (
+        "the dispatch-time resolution that raced the reset re-installed the "
+        "superseded bundle in the shared agent cache"
     )
