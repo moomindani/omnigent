@@ -133,6 +133,7 @@ from omnigent.runner.native import (
     _rewrap_like,
     _session_labels_for_runner_spawn,
     _session_payload_for_host_spawn_check,
+    _session_reset_during_launch_response,
     _unwrap_resolved_spec,
 )
 from omnigent.runner.native import orchestration as _native_runtime
@@ -171,6 +172,7 @@ from omnigent.server.schemas import (
 from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
+from omnigent.terminals.registry import TerminalLaunchSupersededError
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
 from omnigent.tools.builtins.load_skill import (
     find_skill_by_name,
@@ -3892,6 +3894,8 @@ def create_runner_app(
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _session_terminal_epochs.pop(session_id, None)
+        if resource_registry.terminal_registry is not None:
+            resource_registry.terminal_registry.drop_launch_generation(session_id)
         _interrupted_sessions.discard(session_id)
         await _cancel_auto_forwarder_task(session_id)
 
@@ -8595,6 +8599,20 @@ def create_runner_app(
                 parent_os_env=agent_os_env,
                 resource_role=(CLAUDE_NATIVE_TERMINAL_ROLE if bridge_inject else None),
             )
+        except TerminalLaunchSupersededError:
+            # The registry refused the registration: a reset landed while the
+            # terminal was starting. Same contract as the fence check below,
+            # with nothing left to close.
+            _logger.info(
+                "Discarding terminal %s:%s for %s: session was reset mid-launch",
+                terminal_name,
+                session_key,
+                session_id,
+                extra={"session_id": session_id},
+            )
+            if launched_relay is not None:
+                _discard_comment_relay(session_id, launched_relay)
+            return _session_reset_during_launch_response()
         except RuntimeError as exc:
             if launched_relay is not None:
                 _discard_comment_relay(session_id, launched_relay)
@@ -8621,15 +8639,7 @@ def create_runner_app(
             if launched_relay is not None:
                 _discard_comment_relay(session_id, launched_relay)
             await resource_registry.close_terminal(session_id, resource_view.id)
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "error": {
-                        "code": "session_reset_during_launch",
-                        "message": "The session was reset while this terminal was starting.",
-                    }
-                },
-            )
+            return _session_reset_during_launch_response()
 
         if bridge_inject:
             _publish_tmux_target_for_bridge(
@@ -10029,6 +10039,11 @@ def create_runner_app(
         # Bumped first: a terminal already starting must not register after the
         # teardown below, which only closes what is registered right now.
         _session_terminal_epochs[session_id] = _session_terminal_epochs.get(session_id, 0) + 1
+        # Registry-level twin of that bump: fences creators that publish
+        # through TerminalRegistry.launch directly (e.g. sys_terminal_launch),
+        # which never see the per-context fence above.
+        if resource_registry.terminal_registry is not None:
+            resource_registry.terminal_registry.supersede_inflight_launches(session_id)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)

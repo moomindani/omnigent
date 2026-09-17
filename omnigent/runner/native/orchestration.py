@@ -76,6 +76,7 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
 )
 from omnigent.spec.types import AgentSpec
+from omnigent.terminals.registry import TerminalLaunchSupersededError
 
 _logger = logging.getLogger("omnigent.runner.app")
 
@@ -7528,25 +7529,40 @@ async def _discard_terminal_reset_mid_launch(
     ctx: NativeLaunchContext,
     *,
     terminal_name: str,
-    view: SessionResourceView,
+    view: SessionResourceView | None,
 ) -> None:
     """Drop a native terminal whose session was reset while it was starting.
 
-    Closes only the terminal this launch registered: a launch that started
-    after the reset owns whatever else the session holds by now. Then the codex
-    app-server the pane would otherwise leave running (no-op for the other
-    harnesses) and the delete event, so clients drop the pane the builder's
-    create event announced.
+    Closes only the terminal this launch registered (``view`` is ``None``
+    when the registry already refused the registration): a launch that
+    started after the reset owns whatever else the session holds by now.
+    Then the codex app-server the pane would otherwise leave running (no-op
+    for the other harnesses) and the delete event, so clients drop the pane
+    the builder's create event announced.
     """
     from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
 
-    await ctx.resource_registry.close_terminal(ctx.session_id, view.id)
+    if view is not None:
+        await ctx.resource_registry.close_terminal(ctx.session_id, view.id)
     await teardown_codex_native_app_server(ctx.session_id)
     _publish_terminal_deleted_event(
         conversation_id=ctx.session_id,
         terminal_name=terminal_name,
         session_key="main",
         publish_event=ctx.publish_event,
+    )
+
+
+def _session_reset_during_launch_response() -> JSONResponse:
+    """409 telling the caller to re-ask: a reset retired this launch's spec."""
+    return JSONResponse(
+        status_code=409,
+        content={
+            "error": {
+                "code": "session_reset_during_launch",
+                "message": "The session was reset while this terminal was starting.",
+            }
+        },
     )
 
 
@@ -7646,6 +7662,21 @@ async def _launch_native_terminal(
                 )
                 return False
             return True
+        except TerminalLaunchSupersededError:
+            # The registry refused the registration: a reset landed while the
+            # terminal was starting. A supersession, not a start failure — so
+            # no start-error event and no reraise even on the cold-boot path.
+            _logger.info(
+                "Discarding %s terminal for %s: session was reset mid-launch",
+                agent.terminal_name,
+                ctx.session_id,
+            )
+            await _discard_terminal_reset_mid_launch(
+                ctx,
+                terminal_name=agent.terminal_name,
+                view=None,
+            )
+            return False
         except Exception as exc:
             _logger.exception(
                 "Failed to auto-create %s terminal for %s",
@@ -7768,6 +7799,16 @@ async def _ensure_native_terminal(
             if build_context is not None:
                 ctx = await build_context(ctx)
             view = await adapter(ctx)
+        except TerminalLaunchSupersededError:
+            # The registry refused the registration: a reset landed while the
+            # terminal was starting, so the caller must ask again.
+            _logger.info(
+                "Discarding %s terminal for %s: session was reset mid-ensure",
+                terminal_name,
+                ctx.session_id,
+            )
+            await _discard_terminal_reset_mid_launch(ctx, terminal_name=terminal_name, view=None)
+            return _session_reset_during_launch_response()
         except Exception as exc:
             _logger.exception(
                 "%s terminal ensure failed for session=%s",
@@ -7789,15 +7830,7 @@ async def _ensure_native_terminal(
                 terminal_name=terminal_name,
                 view=view,
             )
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "error": {
-                        "code": "session_reset_during_launch",
-                        "message": "The session was reset while this terminal was starting.",
-                    }
-                },
-            )
+            return _session_reset_during_launch_response()
         return respond(view)
 
 
