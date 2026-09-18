@@ -9,11 +9,27 @@ import {
   useSensor,
   useSensors,
 } from "@dnd-kit/core";
-import { ArrowUpIcon, ClockIcon, GripVerticalIcon, PencilIcon, Trash2Icon } from "lucide-react";
+import {
+  ArrowUpIcon,
+  ClockIcon,
+  GripVerticalIcon,
+  ImageIcon,
+  PaperclipIcon,
+  PencilIcon,
+  Trash2Icon,
+} from "lucide-react";
 
+import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { QueuedMessage } from "@/store/chatStore";
+import { attachmentFilename } from "@/lib/attachments";
 import { cn } from "@/lib/utils";
+
+/** Keep touch targets large without enlarging the visible glyphs. */
+const ACTION_BUTTON_CLASS =
+  "flex shrink-0 items-center justify-center rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground max-md:size-11 max-md:text-muted-foreground";
+
+const ACTION_ICON_CLASS = "size-3.5 max-md:size-4";
 
 interface QueuedMessagesStripProps {
   /** Messages waiting to be flushed, in FIFO order (head first). */
@@ -33,7 +49,11 @@ interface QueuedMessagesStripProps {
    * Drives drag-to-reorder; omit to render a non-reorderable strip.
    */
   onReorder?: (queueId: string, beforeQueueId: string | null) => void;
-  /** Column-width class so the strip lines up with the composer card. */
+  /**
+   * Layout class aligning the strip with the composer surface it docks
+   * onto (its tuck only hides behind a surface at least as wide, so match
+   * that surface's width — e.g. the workspace bar's inset).
+   */
   widthClassName?: string;
 }
 
@@ -65,12 +85,18 @@ function QueuedRow({
     id: message.queueId,
     disabled: !reorderable,
   });
+  const hasText = message.text.trim().length > 0;
+  const files = message.files ?? [];
+  const attachmentNames = files.map(attachmentFilename);
+  const AttachmentIcon = files.every((file) => file.type.startsWith("image/"))
+    ? ImageIcon
+    : PaperclipIcon;
 
   return (
     <div
       ref={setDropRef}
       className={cn(
-        "flex items-center gap-1.5 text-sm text-muted-foreground",
+        "flex items-center gap-1.5 text-sm text-muted-foreground max-md:gap-0.5",
         isDragging && "opacity-40",
         isOver && "rounded bg-foreground/5",
       )}
@@ -80,16 +106,53 @@ function QueuedRow({
           type="button"
           ref={setDragRef}
           aria-label="Reorder queued message"
-          className="shrink-0 cursor-grab touch-none rounded p-0.5 text-muted-foreground/50 transition hover:text-foreground focus-visible:text-foreground active:cursor-grabbing"
+          className={cn(
+            ACTION_BUTTON_CLASS,
+            "cursor-grab touch-none text-muted-foreground/50 active:cursor-grabbing max-md:text-muted-foreground/80",
+          )}
           {...attributes}
           {...listeners}
         >
-          <GripVerticalIcon className="size-3.5" aria-hidden="true" />
+          <GripVerticalIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
         </button>
       ) : (
-        <ClockIcon className="size-3.5 shrink-0" aria-hidden="true" />
+        <ClockIcon className={cn(ACTION_ICON_CLASS, "shrink-0")} aria-hidden="true" />
       )}
-      <span className="min-w-0 flex-1 truncate">{message.text}</span>
+      <div className="flex min-w-0 flex-1 items-center gap-2 max-md:flex-col max-md:items-start max-md:gap-0.5">
+        {hasText && (
+          <span className="min-w-0 max-w-full truncate" title={message.text}>
+            {message.text}
+          </span>
+        )}
+        {attachmentNames.length > 0 && (
+          <Badge
+            variant="outline"
+            data-testid="queued-message-attachments"
+            title={attachmentNames.join("\n")}
+            className={cn(
+              "min-w-0 max-w-[min(16rem,100%)] gap-1.5 rounded-md border-border/60 bg-background/50 px-1.5 font-normal text-muted-foreground transition-none max-sm:gap-1 max-sm:px-1",
+              hasText && "md:max-w-[min(14rem,55%)]",
+            )}
+          >
+            <AttachmentIcon
+              className={cn("shrink-0", attachmentNames.length > 1 && "max-sm:hidden")}
+              aria-hidden="true"
+            />
+            <span className="truncate">{attachmentNames[0]}</span>
+            {attachmentNames.length > 1 && (
+              <>
+                <span
+                  className="shrink-0 border-l border-border/60 pl-1.5 tabular-nums max-sm:border-0 max-sm:pl-0"
+                  aria-hidden="true"
+                >
+                  +{attachmentNames.length - 1}
+                </span>
+                <span className="sr-only">, {attachmentNames.slice(1).join(", ")}</span>
+              </>
+            )}
+          </Badge>
+        )}
+      </div>
       {/* Always visible (not hover-gated) so the actions are discoverable;
           they brighten on hover/focus. */}
       {onSteer ? (
@@ -98,10 +161,10 @@ function QueuedRow({
             <button
               type="button"
               aria-label="Send queued message now"
-              className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
+              className={ACTION_BUTTON_CLASS}
               onClick={() => onSteer(message.queueId)}
             >
-              <ArrowUpIcon className="size-3.5" aria-hidden="true" />
+              <ArrowUpIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
             </button>
           </TooltipTrigger>
           <TooltipContent side="top">Send now</TooltipContent>
@@ -110,18 +173,18 @@ function QueuedRow({
       <button
         type="button"
         aria-label="Edit queued message"
-        className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
+        className={ACTION_BUTTON_CLASS}
         onClick={() => onEdit(message.queueId)}
       >
-        <PencilIcon className="size-3.5" aria-hidden="true" />
+        <PencilIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
       </button>
       <button
         type="button"
         aria-label="Remove queued message"
-        className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
+        className={ACTION_BUTTON_CLASS}
         onClick={() => onDelete(message.queueId)}
       >
-        <Trash2Icon className="size-3.5" aria-hidden="true" />
+        <Trash2Icon className={ACTION_ICON_CLASS} aria-hidden="true" />
       </button>
     </div>
   );
@@ -129,7 +192,8 @@ function QueuedRow({
 
 /**
  * Docked strip above the composer listing messages queued while the agent is
- * busy. Peeks above the composer card (`-mb-4` + bottom padding), mirroring
+ * busy. Peeks above the composer stack's top surface (`-mb-4` + bottom
+ * padding tuck its square bottom corners behind it), mirroring
  * `SubagentComposerTray`. Renders nothing when the queue is empty.
  *
  * Each row can be steered (sent now), edited (pulled back into the composer),
@@ -181,12 +245,12 @@ export function QueuedMessagesStrip({
     <div
       data-testid="composer-queued-strip"
       className={cn(
-        "mx-auto -mb-4 flex w-full flex-col rounded-t-2xl bg-tray/40 px-4 pt-1.5 pb-5.5",
+        "mx-auto -mb-4 flex w-full flex-col rounded-t-2xl bg-tray/40 px-4 pt-1.5 pb-5.5 max-sm:px-2",
         widthClassName,
       )}
     >
       {/* Cap the list height and scroll when the queue is long, so a big
-          backlog never pushes the composer off-screen. ~5 rows tall. */}
+          backlog never pushes the composer off-screen. */}
       <div className="flex max-h-32 flex-col gap-1 overflow-y-auto">
         {onReorder === undefined ? (
           rows

@@ -23,30 +23,84 @@ const os = require("node:os");
 const { createRequire } = require("node:module");
 const path = require("node:path");
 const vm = require("node:vm");
+const { EventEmitter } = require("node:events");
 
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
 const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
 const setupSource = readFileSync(path.join(__dirname, "../setup/index.html"), "utf8");
+const urlHelpers = require("../src/url");
 
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 
 function loadNavigationHarness({
   serverUrl = "https://host.example/ml/omnigents",
+  savedServerUrl,
   registerFallbacks = true,
+  databricksMode = "embedded",
+  ensureSession = async (_ses, origin) => origin,
+  expandWorkspace = async (url) => url,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
+  if (savedServerUrl) {
+    fs.writeFileSync(
+      path.join(userData, "settings.json"),
+      JSON.stringify({ server_url: savedServerUrl }),
+    );
+  }
   const listeners = new Map();
-  const calls = { loadFile: [] };
+  const calls = { loadFile: [], loadURL: [], auth: [], manifests: [], progress: [], reloads: 0 };
+  const pickers = [];
+  const ipc = new Map();
+  const webRequest = {};
+  const cookies = Object.assign(new EventEmitter(), {
+    get: async () => [
+      {
+        name: "DBAUTH",
+        domain: new URL(serverUrl).hostname,
+        value: "session",
+        expirationDate: Date.now() / 1000 + 3600,
+      },
+    ],
+  });
+  const defaultSession = {
+    cookies,
+    webRequest: {
+      onBeforeRequest: (fn) => {
+        webRequest.beforeRequest = fn;
+      },
+      onBeforeRedirect: (fn) => {
+        webRequest.beforeRedirect = fn;
+      },
+    },
+  };
+  const bannerCalls = { show: [], hide: 0 };
+  const browserRegistryCalls = { setActive: [], closeAll: [] };
+  let currentUrl = serverUrl;
   const appEvents = new Map();
   const webContents = {
+    id: 1,
+    send: (channel, data) => calls.progress.push({ channel, data }),
+    stop() {},
+    reload() {
+      calls.reloads++;
+    },
+    removeListener(eventName, listener) {
+      listeners.set(
+        eventName,
+        (listeners.get(eventName) ?? []).filter((fn) => fn !== listener),
+      );
+    },
     on(eventName, listener) {
-      listeners.set(eventName, listener);
+      // Multiple modules listen on the same events (navigation fallbacks,
+      // away watch, workspace bounce): keep them all, like a real emitter.
+      if (!listeners.has(eventName)) listeners.set(eventName, []);
+      listeners.get(eventName).push(listener);
     },
     emit(eventName, ...args) {
-      listeners.get(eventName)?.({}, ...args);
+      for (const listener of listeners.get(eventName) ?? []) listener({}, ...args);
     },
-    getURL: () => serverUrl,
+    getURL: () => currentUrl,
     setWindowOpenHandler: () => {},
   };
   const win = {
@@ -63,7 +117,10 @@ function loadNavigationHarness({
       calls.loadFile.push(args);
       return Promise.resolve();
     },
-    loadURL: () => Promise.resolve(),
+    loadURL: (...args) => {
+      calls.loadURL.push(args);
+      return Promise.resolve();
+    },
   };
 
   function createDesktopUpdater() {
@@ -95,11 +152,25 @@ function loadNavigationHarness({
       getVersion: () => "test",
     },
     BrowserWindow: Object.assign(
-      function BrowserWindow() {
+      function BrowserWindow(options) {
+        if (options?.title === "Select a workspace") {
+          let destroyed = false;
+          const picker = Object.assign(new EventEmitter(), {
+            webContents: { id: 100 + pickers.length },
+            isDestroyed: () => destroyed,
+            close() {
+              destroyed = true;
+              this.emit("closed");
+            },
+            loadFile: async () => {},
+          });
+          pickers.push(picker);
+          return picker;
+        }
         return win;
       },
       {
-        fromWebContents: () => null,
+        fromWebContents: (sender) => (sender === webContents ? win : null),
         getFocusedWindow: () => null,
         getAllWindows: () => [],
       },
@@ -109,11 +180,11 @@ function loadNavigationHarness({
     Notification: { isSupported: () => false },
     clipboard: { writeText: () => {} },
     dialog: {},
-    ipcMain: { handle: () => {}, on: () => {} },
+    ipcMain: { handle: (name, fn) => ipc.set(name, fn), on: (name, fn) => ipc.set(name, fn) },
     nativeImage: { createFromPath: () => ({ isEmpty: () => true }) },
     nativeTheme: { shouldUseDarkColors: false, on: () => {} },
     screen: {},
-    session: { defaultSession: {} },
+    session: { defaultSession },
     shell: {},
     systemPreferences: {},
   };
@@ -125,9 +196,13 @@ function loadNavigationHarness({
     },
     "./localhost_cors": { registerLocalhostCors: () => {} },
     "./url": {
+      ...urlHelpers,
       normalizeUrl: (url) => url,
-      expandDatabricksWorkspaceUrl: async (url) => url,
-      fetchServerManifest: async () => ({}),
+      expandDatabricksWorkspaceUrl: expandWorkspace,
+      fetchServerManifest: async (url) => {
+        calls.manifests.push(url);
+        return {};
+      },
       PRE_MANIFEST_BASELINE: {},
     },
     "./deepLink": {
@@ -135,14 +210,44 @@ function loadNavigationHarness({
       chooseDeepLinkStrategy: () => null,
     },
     "./workspace-chrome": { registerWorkspaceChromeHide: () => {} },
+    "./databricks-session": {
+      ensureDatabricksSession: (...args) => {
+        calls.auth.push(args);
+        return ensureSession(...args);
+      },
+    },
+    "./databricks-oauth": {
+      expireStoredAccessToken: () => false,
+      removeStoredRefreshToken: () => false,
+    },
+    "./databricks-auth": {
+      ...require("../src/databricks-auth"),
+      readDatabricksAuthMode: () => databricksMode,
+    },
+    // The bounce's behavior is unit-tested in workspace-root-bounce.test.js;
+    // stubbed here because it would call into the stubbed ./url module. The
+    // away banner is intentionally NOT stubbed: its wiring through
+    // createWindow is what the behavior test below exercises.
+    "./workspace-root-bounce": { registerWorkspaceRootBounce: () => {} },
+    "./return_banner": {
+      createReturnBanner: () => ({
+        ensureBanner: () => {},
+        show: (bannerWin, returnUrl) => bannerCalls.show.push({ win: bannerWin, returnUrl }),
+        hide: () => bannerCalls.hide++,
+        registerIpc: () => {},
+      }),
+    },
     "./browserViewRegistry": {
-      createBrowserViewRegistry: () => ({ closeAll: () => {} }),
+      createBrowserViewRegistry: () => ({
+        closeAll: (reason) => browserRegistryCalls.closeAll.push(reason),
+        setActive: (conversationId) => browserRegistryCalls.setActive.push(conversationId),
+      }),
     },
     "./browserViewBounds": {
       createBrowserViewBoundsController: () => ({ attach: () => {}, detach: () => {} }),
     },
     "./browserIpc": { registerBrowserIpc: () => {} },
-    "./session-expiry": { registerSessionExpiryReload: () => {} },
+    "./session-expiry": require("../src/session-expiry"),
     "./popupPolicy": {
       decideWindowOpen: () => ({ kind: "ignore" }),
       stripCrossOriginOpenerHeaders: () => {},
@@ -169,7 +274,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { createWindow, registerNavigationFallbacks, windows, SETUP_PAGE };";
+    "\nmodule.exports.testApi = { createWindow, loadServerUrl, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; } };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -208,15 +313,376 @@ function loadNavigationHarness({
   return {
     api,
     calls,
+    bannerCalls,
+    browserRegistryCalls,
+    ipc,
+    webRequest,
+    webContents,
+    settingsPath: path.join(userData, "settings.json"),
+    pickers,
     emit: (eventName, ...args) => webContents.emit(eventName, ...args),
     hasListener: (eventName) => listeners.has(eventName),
+    setUrl: (url) => {
+      currentUrl = url;
+    },
     win,
     cleanup: () => {
+      api.disposeAuth();
       api.windows.clear();
       fs.rmSync(userData, { recursive: true, force: true });
     },
   };
 }
+
+describe("Databricks auth mode wiring", () => {
+  const workspace = "https://workspace.cloud.databricks.com/omnigent";
+  const tick = () =>
+    new Promise((resolve) => {
+      setTimeout(resolve, 5);
+    });
+
+  it("prepares browser auth before an explicit connection loads", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser" });
+    t.after(h.cleanup);
+    await h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true });
+    assert.equal(h.calls.auth.length, 1);
+    assert.equal(h.calls.auth[0][2].interactive, true);
+    assert.deepEqual(h.calls.loadURL, [[workspace]]);
+    assert.deepEqual(h.calls.manifests, [workspace]);
+  });
+
+  it("fails into shell-owned retry, never embedded login, when OAuth is unavailable", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      ensureSession: async () => {
+        throw new Error("OAuth client unavailable");
+      },
+    });
+    t.after(h.cleanup);
+    await assert.rejects(
+      h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true }),
+      /unavailable/,
+    );
+    await tick();
+    assert.deepEqual(h.calls.loadURL, []);
+    assert.equal(h.api.windows.get(h.win).origin, null);
+    const params = new URLSearchParams(h.calls.loadFile[0][1].search);
+    assert.equal(params.get("error"), "Couldn't sign in to Databricks. Please try again.");
+    assert.equal(params.get("url"), workspace);
+  });
+
+  it("prepares stored credentials on saved-server launch and deep-link loads", async (t) => {
+    const h = loadNavigationHarness({
+      savedServerUrl: workspace,
+      serverUrl: workspace,
+      databricksMode: "browser",
+    });
+    t.after(h.cleanup);
+    h.api.createWindow();
+    await tick();
+    assert.equal(h.calls.auth[0][2].interactive, false);
+    assert.deepEqual(h.calls.loadURL, [[workspace]]);
+    await h.api.loadServerUrl(h.win, workspace, "/c/deep-linked");
+    assert.equal(h.calls.auth[1][2].interactive, false);
+    assert.deepEqual(h.calls.loadURL[1], [`${workspace}/c/deep-linked`]);
+  });
+
+  it("never opens browser OAuth for the explicit embedded rollback or non-workspace servers", async (t) => {
+    await Promise.all(
+      [
+        [workspace, "embedded"],
+        ["https://demo.databricksapps.com", "browser"],
+        ["https://server.example", "browser"],
+      ].map(async ([url, mode]) => {
+        const h = loadNavigationHarness({ serverUrl: url, databricksMode: mode });
+        t.after(h.cleanup);
+        await h.api.loadServerUrl(h.win, url, undefined, { interactive: true });
+        assert.deepEqual(h.calls.auth, []);
+        assert.deepEqual(h.calls.loadURL, [[url]]);
+        assert.equal(h.webRequest.beforeRequest, undefined);
+      }),
+    );
+  });
+
+  it("excludes browser mode from legacy expiry reloads and the away banner", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser" });
+    t.after(h.cleanup);
+    h.api.setAwayBannerDelayMs(1);
+    h.api.createWindow(workspace);
+    await tick();
+    h.api.registerSessionExpiryAccess();
+    h.webRequest.beforeRedirect({
+      url: `${new URL(workspace).origin}/api/test`,
+      statusCode: 303,
+      redirectURL: `${new URL(workspace).origin}/login.html`,
+    });
+    h.setUrl("https://identity.example/login");
+    h.emit("did-navigate", "https://identity.example/login");
+    await tick();
+    assert.equal(h.calls.reloads, 0);
+    assert.equal(h.calls.auth.length, 1);
+    assert.deepEqual(h.bannerCalls.show, []);
+  });
+
+  it("keeps late login navigation blocked after failed renewal unpins the window", async (t) => {
+    let first = true;
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      ensureSession: async (_ses, origin) => {
+        if (first) {
+          first = false;
+          return origin;
+        }
+        throw Object.assign(new Error("stored token is expired with no refresh token"), {
+          errorCode: "NO_REFRESH_TOKEN",
+        });
+      },
+    });
+    t.after(h.cleanup);
+    await h.api.loadServerUrl(h.win, workspace);
+    const session = h.calls.auth[0][0];
+    session.cookies.emit(
+      "changed",
+      {},
+      {
+        name: "DBAUTH",
+        domain: new URL(workspace).hostname,
+        hostOnly: true,
+      },
+      "expired",
+      true,
+    );
+    await tick();
+    assert.equal(h.api.windows.get(h.win).origin, null);
+    assert.equal(h.calls.loadFile.length, 1);
+    const params = new URLSearchParams(h.calls.loadFile[0][1].search);
+    assert.equal(params.get("url"), workspace);
+    assert.equal(params.get("error"), "Session expired. Connect to sign in again.");
+    const request = (url) => {
+      let result;
+      h.webRequest.beforeRequest(
+        { webContentsId: h.webContents.id, resourceType: "mainFrame", url },
+        (reply) => {
+          result = reply;
+        },
+      );
+      return result;
+    };
+    assert.equal(request(`${new URL(workspace).origin}/login/sso`).cancel, true);
+    assert.equal(request("https://identity.example/login").cancel, true);
+    assert.notEqual(request(`file://${h.api.SETUP_PAGE}?error=expired`).cancel, true);
+    await h.api.loadServerUrl(h.win, "https://server.example");
+    assert.notEqual(request("https://server.example").cancel, true);
+    first = true;
+    await h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true });
+    assert.notEqual(request(workspace).cancel, true);
+  });
+
+  it("returns to the selector when a same-document navigation enters workspace login", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser" });
+    t.after(h.cleanup);
+    await h.api.loadServerUrl(h.win, workspace);
+    h.emit("did-navigate-in-page", `${new URL(workspace).origin}/login/sso`, true);
+    await tick();
+    assert.equal(h.api.windows.get(h.win).origin, null);
+    assert.equal(h.calls.loadFile.length, 1);
+    assert.equal(h.calls.auth.length, 1);
+  });
+
+  it("retains legacy expiry reloads with the explicit embedded rollback", (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "embedded" });
+    t.after(h.cleanup);
+    h.api.registerSessionExpiryAccess();
+    h.webRequest.beforeRedirect({
+      url: `${workspace}/api/test`,
+      statusCode: 303,
+      redirectURL: `${new URL(workspace).origin}/login.html`,
+    });
+    assert.equal(h.calls.reloads, 1);
+    assert.deepEqual(h.calls.auth, []);
+  });
+
+  it("routes setup and server-switch IPC through the selected authentication mode", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const setupEvent = {
+      sender: h.webContents,
+      senderFrame: { url: `file://${h.api.SETUP_PAGE}` },
+    };
+    await h.ipc.get("omnigent:set-server-url")(setupEvent, workspace);
+    assert.equal(h.calls.auth.length, 1);
+    assert.equal(h.calls.auth[0][2].interactive, true);
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ recent_servers: [workspace] }));
+    h.setUrl(workspace);
+    await h.ipc.get("omnigent:switch-server")(
+      { sender: h.webContents, senderFrame: { url: workspace } },
+      workspace,
+    );
+    await tick();
+    assert.equal(h.calls.auth.length, 2);
+    assert.equal(h.calls.auth[1][2].interactive, false);
+  });
+
+  it("fetches the selected workspace's manifest after an account-first login", async (t) => {
+    const account = "https://accounts.cloud.databricks.com/omnigent";
+    const h = loadNavigationHarness({
+      serverUrl: account,
+      databricksMode: "browser",
+      ensureSession: async () => new URL(workspace).origin,
+    });
+    t.after(h.cleanup);
+    await h.api.loadServerUrl(h.win, account, undefined, { interactive: true });
+    assert.deepEqual(h.calls.loadURL, [[workspace]]);
+    assert.deepEqual(h.calls.manifests, [workspace]);
+    assert.equal(h.api.windows.get(h.win).origin, new URL(workspace).origin);
+  });
+
+  it("reports authentication and cancels only the owning setup window's matching request", async (t) => {
+    let signal;
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      ensureSession: (_ses, _origin, options) =>
+        new Promise((_resolve, reject) => {
+          signal = options.signal;
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        }),
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: `file://${h.api.SETUP_PAGE}` } };
+    const connecting = h.ipc.get("omnigent:set-server-url")(event, workspace, {
+      requestId: "login-1",
+    });
+    await tick();
+    assert.deepEqual(
+      h.calls.progress.map((p) => p.data.phase),
+      ["connecting", "authenticating"],
+    );
+    assert.equal(h.ipc.get("omnigent:cancel-server-connection")(event, "wrong-id"), false);
+    assert.equal(
+      h.ipc.get("omnigent:cancel-server-connection")({ ...event, sender: {} }, "login-1"),
+      false,
+    );
+    assert.throws(
+      () =>
+        h.ipc.get("omnigent:cancel-server-connection")(
+          {
+            sender: h.webContents,
+            senderFrame: { url: workspace },
+          },
+          "login-1",
+        ),
+      /setup page/,
+    );
+    assert.equal(signal.aborted, false);
+    assert.equal(h.ipc.get("omnigent:cancel-server-connection")(event, "login-1"), true);
+    assert.equal((await connecting).cancelled, true);
+    assert.equal(signal.aborted, true);
+    assert.deepEqual(h.calls.loadURL, []);
+    assert.deepEqual(h.calls.loadFile, []);
+    assert.equal(h.api.windows.get(h.win).origin, null);
+  });
+
+  it("can cancel URL preflight before OAuth begins", async (t) => {
+    let signal;
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      expandWorkspace: (_url, options) =>
+        new Promise((_resolve, reject) => {
+          signal = options.signal;
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        }),
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.api.pinWindow(h.win, null);
+    const event = { sender: h.webContents, senderFrame: { url: `file://${h.api.SETUP_PAGE}` } };
+    const connecting = h.ipc.get("omnigent:set-server-url")(event, workspace, {
+      requestId: "preflight",
+    });
+    h.ipc.get("omnigent:cancel-server-connection")(event, "preflight");
+    assert.equal((await connecting).cancelled, true);
+    assert.equal(signal.aborted, true);
+    assert.deepEqual(h.calls.auth, []);
+    assert.deepEqual(h.calls.loadURL, []);
+    assert.deepEqual(
+      h.calls.progress.map((p) => p.data.phase),
+      ["connecting"],
+    );
+  });
+
+  it("ignores a late cancelled login result after the user starts a new attempt", async (t) => {
+    const pending = [];
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      ensureSession: (_ses, origin, options) =>
+        new Promise((resolve) => {
+          pending.push({ resolve: () => resolve(origin), signal: options.signal });
+        }),
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: `file://${h.api.SETUP_PAGE}` } };
+    const first = h.ipc.get("omnigent:set-server-url")(event, workspace, { requestId: "first" });
+    await tick();
+    h.ipc.get("omnigent:cancel-server-connection")(event, "first");
+    const second = h.ipc.get("omnigent:set-server-url")(event, workspace, { requestId: "second" });
+    await tick();
+    assert.equal(h.ipc.get("omnigent:cancel-server-connection")(event, "first"), false);
+    pending[0].resolve();
+    assert.equal((await first).cancelled, true);
+    assert.equal(pending[1].signal.aborted, false);
+    assert.deepEqual(h.calls.loadURL, []);
+    pending[1].resolve();
+    await second;
+    assert.deepEqual(h.calls.loadURL, [[workspace]]);
+  });
+
+  it("dismisses and unregisters the workspace picker when its login is cancelled", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const controller = new AbortController();
+    const selection = h.api.pickWorkspaceForBridge(
+      h.win,
+      [{ workspaceId: "1", fqdn: new URL(workspace).hostname }],
+      { signal: controller.signal },
+    );
+    const picker = h.pickers[0];
+    assert.equal(h.ipc.get("workspacePicker:list")({ sender: picker.webContents }).length, 1);
+    const rejected = assert.rejects(selection, (error) => error.name === "AbortError");
+    controller.abort();
+    await rejected;
+    assert.equal(picker.isDestroyed(), true);
+    assert.equal(h.ipc.get("workspacePicker:list")({ sender: picker.webContents }).length, 0);
+  });
+
+  it("ignores completion of an authentication attempt after switching servers", async (t) => {
+    let finish;
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      ensureSession: () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    });
+    t.after(h.cleanup);
+    const pending = h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true });
+    await h.api.loadServerUrl(h.win, "https://server.example");
+    const rejected = assert.rejects(pending, /superseded/);
+    finish(new URL(workspace).origin);
+    await rejected;
+    assert.deepEqual(h.calls.loadURL, [["https://server.example"]]);
+    assert.deepEqual(h.calls.loadFile, []);
+  });
+});
 
 describe("setup clipboard IPC wiring", () => {
   it("exposes a narrow copy action through the setup bridge", () => {
@@ -230,6 +696,16 @@ describe("setup clipboard IPC wiring", () => {
     assert.match(
       liveCode,
       /ipcMain\.handle\("omnigent:copy-setup-text",[\s\S]{0,200}!isSetupPageSender\(event\)[\s\S]{0,300}clipboard\.writeText\(text\)/,
+    );
+  });
+});
+
+describe("macOS activation wiring", () => {
+  it("counts tracked shell windows instead of utility windows", () => {
+    assert.match(liveCode, /app\.on\("activate"[\s\S]{0,500}windows\.size === 0/);
+    assert.doesNotMatch(
+      liveCode,
+      /app\.on\("activate"[\s\S]{0,500}BrowserWindow\.getAllWindows\(\)\.length === 0/,
     );
   });
 });
@@ -249,7 +725,7 @@ describe("managed server preference wiring", () => {
   it("preserves a managed path while still expanding bare workspace roots", () => {
     assert.match(
       liveCode,
-      /managedTarget\s*\?\?\s*normalizeUrl\(url\)[\s\S]{0,120}await expandDatabricksWorkspaceUrl\(normalized\)/,
+      /managedTarget\s*\?\?\s*normalizeUrl\(url\)[\s\S]{0,120}await expandDatabricksWorkspaceUrl\(normalized,\s*\{\s*signal\s*\}\)/,
     );
   });
 
@@ -273,6 +749,47 @@ describe("managed server preference wiring", () => {
   });
 });
 
+describe("Databricks-internal local-host CLI wiring", () => {
+  it("selects isaac omni only behind the internal flag and Databricks server gate", () => {
+    assert.match(
+      liveCode,
+      /function hostCliCommand\(serverUrl\)[\s\S]{0,300}databricksInternalFeaturesEnabled\(\)[\s\S]{0,120}isDatabricksManagedServerUrl\(serverUrl\)[\s\S]{0,300}prefixArgs:\s*\["omni"\]/,
+    );
+  });
+
+  it("uses the selected command for identity availability and every host action", () => {
+    assert.match(
+      liveCode,
+      /host-get-identity[\s\S]{0,350}Boolean\(hostCliCommand\(senderServerUrl\(event\)\)\)/,
+    );
+    assert.match(
+      liveCode,
+      /host-control[\s\S]{0,450}const cliCommand = hostCliCommand\(serverUrl\)[\s\S]{0,1400}ensureServerAuth\(cliCommand, serverUrl\)[\s\S]{0,400}ensureHostConnected\(cliCommand, serverUrl\)[\s\S]{0,300}disconnectHost\(cliCommand, serverUrl\)/,
+    );
+  });
+
+  it("disables CLI customization in main and explains managed policy in the setup dialog", () => {
+    assert.match(
+      liveCode,
+      /omnigent:set-cli-path[\s\S]{0,300}databricksInternalFeaturesEnabled\(\)[\s\S]{0,250}customizationDisabled:\s*true[\s\S]{0,80}accepted:\s*false/,
+    );
+    assert.match(
+      liveCode,
+      /omnigent:browse-cli-path[\s\S]{0,250}databricksInternalFeaturesEnabled\(\)\) return null/,
+    );
+    assert.match(
+      liveCode,
+      /omnigent:cli-reset-path[\s\S]{0,250}databricksInternalFeaturesEnabled\(\)[\s\S]{0,250}customizationDisabled:\s*true/,
+    );
+    assert.match(setupSource, /cliGear\.hidden = false/);
+    assert.match(setupSource, /cliManaged\.hidden = !cliCustomizationDisabled/);
+    assert.match(setupSource, /cliPathInput\.disabled = cliCustomizationDisabled/);
+    assert.match(setupSource, /cliBrowse\.disabled = cliCustomizationDisabled/);
+    assert.match(setupSource, /cliRedetect\.disabled = cliCustomizationDisabled/);
+    assert.match(setupSource, /Managed by your organization/);
+  });
+});
+
 describe("production developer-mode wiring (src/main.js)", () => {
   it("uses the same opt-in to enable the shell window's DevTools capability", () => {
     assert.match(liveCode, /webPreferences:\s*\{[\s\S]{0,400}devTools:\s*developerModeEnabled\(\)/);
@@ -285,6 +802,105 @@ describe("workspace root bounce wiring (src/main.js)", () => {
       liveCode,
       /registerWorkspaceRootBounce\(\s*win\.webContents,\s*\(\)\s*=>\s*pinnedOrigin\(win\)\s*\)/,
     );
+  });
+});
+
+describe("return-to-server banner wiring (src/main.js)", () => {
+  it("registers the away watch against the window's current pinned origin", () => {
+    assert.match(
+      liveCode,
+      /registerServerAwayWatch\(\s*win\.webContents,\s*\{[\s\S]{0,400}getPinnedOrigin:\s*\(\)\s*=>\s*\(?usesBrowserAuth\(pinnedOrigin\(win\)\)\s*\?\s*null\s*:\s*pinnedOrigin\(win\)/,
+      [
+        "src/main.js no longer registers registerServerAwayWatch in createWindow (it was",
+        "removed or commented out). That watch is what shows the 'return to your server?'",
+        "banner when an SSO flow navigates the window away from its server and doesn't",
+        "bring it back. Re-add the call (the behavior lives in src/away_banner.js and",
+        "src/return_banner.js); do not delete this test.",
+      ].join(" "),
+    );
+  });
+
+  it("registers the banner's IPC handlers", () => {
+    assert.match(liveCode, /returnBanner\.registerIpc\(\)/);
+  });
+
+  it("shows the banner after a foreign commit outlasts the delay, hides on return", async () => {
+    // End-to-end through the REAL createWindow + away_banner (return_banner
+    // stubbed): the regression this guards is the banner never appearing
+    // because a listener wasn't wired, the pin wasn't read, or the delay
+    // option never reached the watch.
+    const harness = loadNavigationHarness({ registerFallbacks: false });
+    harness.api.setAwayBannerDelayMs(5);
+    harness.api.createWindow("https://host.example/ml/omnigents");
+
+    // SSO navigates the window to the IdP and leaves it there.
+    harness.setUrl("https://company.okta.com/login");
+    harness.emit("did-navigate", "https://company.okta.com/login", 200, "OK");
+    await new Promise((resolve) => {
+      setTimeout(resolve, 30);
+    });
+
+    // The window never committed an on-server page in this scenario, so the
+    // offer falls back to the stored server URL.
+    assert.equal(harness.bannerCalls.show.length, 1);
+    assert.equal(harness.bannerCalls.show[0].win, harness.win);
+    assert.equal(harness.bannerCalls.show[0].returnUrl, "https://host.example/ml/omnigents");
+
+    // Coming back to the server hides the banner.
+    harness.setUrl("https://host.example/ml/omnigents");
+    harness.emit("did-navigate", "https://host.example/ml/omnigents", 200, "OK");
+    assert.equal(harness.bannerCalls.hide, 1);
+    harness.cleanup();
+  });
+
+  it("never offers a same-origin SSO gate page as the return target", async () => {
+    // Regression: the Databricks workspace login page (login.html) is served
+    // on the SAME origin as the pinned server. An origin-only watch recorded
+    // it as the return target, and the banner offered to "go back" to the
+    // login page the user was stuck behind.
+    const harness = loadNavigationHarness({ registerFallbacks: false });
+    harness.api.setAwayBannerDelayMs(5);
+    harness.api.createWindow("https://host.example/ml/omnigents");
+
+    harness.setUrl("https://host.example/ml/omnigents");
+    harness.emit("did-navigate", "https://host.example/ml/omnigents", 200, "OK");
+    harness.setUrl("https://host.example/login.html?next_url=%2Fml%2Fomnigents");
+    harness.emit(
+      "did-navigate",
+      "https://host.example/login.html?next_url=%2Fml%2Fomnigents",
+      200,
+      "OK",
+    );
+    harness.setUrl("https://company.okta.com/login");
+    harness.emit("did-navigate", "https://company.okta.com/login", 200, "OK");
+    await new Promise((resolve) => {
+      setTimeout(resolve, 30);
+    });
+
+    assert.equal(harness.bannerCalls.show.length, 1);
+    assert.equal(harness.bannerCalls.show[0].returnUrl, "https://host.example/ml/omnigents");
+    // Clean up the episode (hides the banner, cancels any re-arm).
+    harness.setUrl("https://host.example/ml/omnigents");
+    harness.emit("did-navigate", "https://host.example/ml/omnigents", 200, "OK");
+    harness.cleanup();
+  });
+
+  it("does not show the banner for a quick SSO round-trip", async () => {
+    const harness = loadNavigationHarness({ registerFallbacks: false });
+    harness.api.setAwayBannerDelayMs(50);
+    harness.api.createWindow("https://host.example/ml/omnigents");
+
+    harness.setUrl("https://company.okta.com/login");
+    harness.emit("did-navigate", "https://company.okta.com/login", 200, "OK");
+    // The flow hands back to the server before the delay elapses.
+    harness.setUrl("https://host.example/ml/omnigents");
+    harness.emit("did-navigate", "https://host.example/ml/omnigents", 200, "OK");
+    await new Promise((resolve) => {
+      setTimeout(resolve, 100);
+    });
+
+    assert.equal(harness.bannerCalls.show.length, 0);
+    harness.cleanup();
   });
 });
 
@@ -320,17 +936,76 @@ describe("workspace chrome injection wiring (src/main.js)", () => {
 });
 
 describe("navigation fallback wiring (src/main.js)", () => {
-  it("registers navigation fallbacks when createWindow builds a window", () => {
+  it("boots a saved Databricks API URL on the UI mount without losing URL state", () => {
+    const saved = "https://workspace.cloud.databricks.com/api/2.0/omnigent/?o=123#conversation";
+    const harness = loadNavigationHarness({
+      savedServerUrl: saved,
+      registerFallbacks: false,
+    });
+
+    harness.api.createWindow();
+
+    assert.equal(
+      harness.calls.loadURL[0][0],
+      "https://workspace.cloud.databricks.com/omnigent?o=123#conversation",
+    );
+    harness.cleanup();
+  });
+
+  it("registers navigation fallbacks when createWindow builds a window", async () => {
     const harness = loadNavigationHarness({ registerFallbacks: false });
 
     const win = harness.api.createWindow("https://host.example/ml/omnigents");
     harness.emit("did-navigate", "https://host.example/ml/omnigents/", 503, "Unavailable");
+    // loadSetupPage defers its navigation a tick (see main.js loadSetupPage).
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
 
     assert.equal(win, harness.win);
     assert.equal(harness.hasListener("did-fail-load"), true);
     assert.equal(harness.hasListener("did-navigate"), true);
     assert.equal(harness.calls.loadFile.length, 1);
     assert.equal(harness.calls.loadFile[0][0], harness.api.SETUP_PAGE);
+    harness.cleanup();
+  });
+});
+
+describe("browser view detach on main-frame navigation (src/main.js)", () => {
+  it("detaches the embedded browser view when the shell commits a new document", () => {
+    // Regression: the session-expiry watcher reloads the window onto the
+    // workspace sign-in page. That navigation tears down the SPA renderer
+    // WITHOUT BrowserPane's unmount detach, so nothing detached the native
+    // WebContentsView — it kept painting over the sign-in page, and over the
+    // SPA after signing back in.
+    const harness = loadNavigationHarness({ registerFallbacks: false });
+    harness.api.createWindow("https://host.example/ml/omnigents");
+
+    harness.setUrl("https://host.example/login.html?next_url=%2Fml%2Fomnigents");
+    harness.emit(
+      "did-navigate",
+      "https://host.example/login.html?next_url=%2Fml%2Fomnigents",
+      200,
+      "OK",
+    );
+
+    assert.deepEqual(harness.browserRegistryCalls.setActive, [null]);
+    harness.cleanup();
+  });
+
+  it("detaches again when the user signs back in (each committed document)", () => {
+    const harness = loadNavigationHarness({ registerFallbacks: false });
+    harness.api.createWindow("https://host.example/ml/omnigents");
+
+    harness.setUrl("https://host.example/login.html");
+    harness.emit("did-navigate", "https://host.example/login.html", 200, "OK");
+    harness.setUrl("https://host.example/ml/omnigents");
+    harness.emit("did-navigate", "https://host.example/ml/omnigents", 200, "OK");
+
+    // One detach per committed main-frame document: the login page and the
+    // re-signed-in SPA. A re-mounted BrowserPane re-attaches via
+    // browser-set-active, so detaching on the SPA commit is safe.
+    assert.deepEqual(harness.browserRegistryCalls.setActive, [null, null]);
     harness.cleanup();
   });
 });
@@ -343,7 +1018,7 @@ describe("window-open policy wiring (src/main.js)", () => {
   it("routes setWindowOpenHandler decisions through decideWindowOpen as live code", () => {
     assert.match(
       liveCode,
-      /setWindowOpenHandler\(\s*\(\{\s*url,\s*disposition,\s*features\s*\}\)\s*=>\s*\{[\s\S]{0,200}decideWindowOpen\(/,
+      /setWindowOpenHandler\(\s*\(\{\s*url,\s*disposition,\s*features\s*\}\)\s*=>\s*\{[\s\S]{0,500}decideWindowOpen\(/,
       [
         "src/main.js no longer passes window.open through decideWindowOpen. Either every",
         "popup is denied (OAuth sign-in breaks) or popups open without the",
@@ -440,12 +1115,12 @@ describe("recent-server startup wiring (src/main.js)", () => {
   it("backfills a saved server only after its cold load succeeds", () => {
     assert.match(
       liveCode,
-      /loadURL\(destination\)\s*\.then\(\(\)\s*=>\s*\{\s*if\s*\(!ephemeral\s*&&\s*!explicit\s*&&\s*serverUrl\)[\s\S]{0,200}rememberRecentServer\(settings,\s*serverUrl\)/,
+      /loadServerUrl\(win,\s*serverUrl,\s*undefined,\s*\{\s*loadUrl:\s*destination\s*\}\)\s*\.then\(\(\)\s*=>\s*\{\s*if\s*\(!ephemeral\s*&&\s*!explicit\s*&&\s*serverUrl\)[\s\S]{0,200}rememberRecentServer\(settings,\s*serverUrl\)/,
       [
         "createWindow no longer backfills a successfully loaded saved server into",
         "recent_servers. Existing installs can have server_url without recent_servers,",
         "so the setup page would show no recents after leaving that server. Keep the",
-        "backfill in loadURL(destination).then, gated away from ephemeral windows and",
+        "backfill after loadServerUrl resolves, gated away from ephemeral windows and",
         "explicit target URLs (which may include a conversation path).",
       ].join(" "),
     );
@@ -635,11 +1310,19 @@ describe("deep-link ingestion wiring (src/main.js)", () => {
 // carries httpResponseCode for main-frame navigations — fall back to setup
 // with ?error=&url= the same way the net-error path does.
 describe("HTTP error status fallback (src/main.js)", () => {
-  it("routes a 404 to the setup error surface with the mounted server URL", (t) => {
+  // loadSetupPage defers its navigation to the next tick (see main.js), so the
+  // fallback's loadFile lands a macrotask after the event is emitted.
+  const flush = () =>
+    new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+
+  it("routes a 404 to the setup error surface with the mounted server URL", async (t) => {
     const harness = loadNavigationHarness();
     t.after(harness.cleanup);
 
     harness.emit("did-navigate", "https://host.example/ml/omnigents/health", 404, "Not Found");
+    await flush();
 
     assert.equal(harness.calls.loadFile.length, 1);
     assert.equal(harness.calls.loadFile[0][0], harness.api.SETUP_PAGE);
@@ -648,11 +1331,12 @@ describe("HTTP error status fallback (src/main.js)", () => {
     assert.equal(params.get("url"), "https://host.example/ml/omnigents");
   });
 
-  it("routes a 503 to the same setup error surface", (t) => {
+  it("routes a 503 to the same setup error surface", async (t) => {
     const harness = loadNavigationHarness();
     t.after(harness.cleanup);
 
     harness.emit("did-navigate", "https://host.example/ml/omnigents/", 503, "Service Unavailable");
+    await flush();
 
     assert.equal(harness.calls.loadFile.length, 1);
     const params = new URLSearchParams(harness.calls.loadFile[0][1].search);
@@ -660,17 +1344,18 @@ describe("HTTP error status fallback (src/main.js)", () => {
     assert.equal(params.get("url"), "https://host.example/ml/omnigents");
   });
 
-  it("does not fall back for successful or redirect navigations", (t) => {
+  it("does not fall back for successful or redirect navigations", async (t) => {
     const harness = loadNavigationHarness();
     t.after(harness.cleanup);
 
     harness.emit("did-navigate", "https://host.example/ml/omnigents/", 200, "OK");
     harness.emit("did-navigate", "https://host.example/ml/omnigents/login", 302, "Found");
+    await flush();
 
     assert.deepEqual(harness.calls.loadFile, []);
   });
 
-  it("ignores a duplicate failure after the first fallback unpins the window", (t) => {
+  it("ignores a duplicate failure after the first fallback unpins the window", async (t) => {
     const harness = loadNavigationHarness();
     t.after(harness.cleanup);
 
@@ -680,11 +1365,12 @@ describe("HTTP error status fallback (src/main.js)", () => {
     assert.equal(harness.api.windows.get(harness.win).origin, null);
     // Unpinning makes the origin guard reject re-entry.
     harness.emit("did-navigate", failedUrl, 503, "Service Unavailable");
+    await flush();
 
     assert.equal(harness.calls.loadFile.length, 1);
   });
 
-  it("keeps the network-error fallback and ignores ERR_ABORTED", (t) => {
+  it("keeps the network-error fallback and ignores ERR_ABORTED", async (t) => {
     const harness = loadNavigationHarness();
     t.after(harness.cleanup);
 
@@ -695,11 +1381,13 @@ describe("HTTP error status fallback (src/main.js)", () => {
       "https://host.example/ml/omnigents/",
       true,
     );
+    await flush();
     assert.equal(harness.calls.loadFile.length, 1);
 
     const aborted = loadNavigationHarness();
     t.after(aborted.cleanup);
     aborted.emit("did-fail-load", -3, "ABORTED", "https://host.example/ml/omnigents/", true);
+    await flush();
     assert.deepEqual(aborted.calls.loadFile, []);
   });
 });
@@ -713,7 +1401,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
   it("closes the window's browserRegistry when pinWindow changes origin", () => {
     assert.match(
       liveCode,
-      /function pinWindow\(win,\s*origin\)\s*\{[\s\S]{0,600}browserRegistry\?\.closeAll\(/,
+      /function pinWindow\(win,\s*origin,\s*attemptToKeep\)\s*\{[\s\S]{0,700}browserRegistry\?\.closeAll\(/,
       [
         "pinWindow no longer closes the window's embedded-browser views when the",
         "origin changes. Leaving a server (Connect to new server / Change Server / switch)",
@@ -727,7 +1415,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
   it("guards the teardown so the initial cold-connect pin doesn't fire it", () => {
     assert.match(
       liveCode,
-      /function pinWindow\(win,\s*origin\)\s*\{[\s\S]{0,600}state\.origin\s*!=\s*null[\s\S]{0,120}browserRegistry\?\.closeAll\(/,
+      /function pinWindow\(win,\s*origin,\s*attemptToKeep\)\s*\{[\s\S]{0,700}state\.origin\s*!=\s*null[\s\S]{0,120}browserRegistry\?\.closeAll\(/,
       [
         "The closeAll in pinWindow is no longer guarded on a prior origin. Without the",
         "state.origin != null guard the initial pin (setup→first connect) would try to",

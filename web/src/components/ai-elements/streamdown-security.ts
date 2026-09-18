@@ -41,6 +41,29 @@ export const WORKSPACE_FILE_LINK_ATTR = "data-omnigent-file";
 // lookahead keeps a cited position off the scheme branch: `notes.md:12` is a
 // filename plus a line number, but is otherwise shaped exactly like a scheme.
 const NON_FILE_HREF = /^(?:[a-zA-Z][a-zA-Z0-9+.-]*:(?!\d+(?::\d+)?$)|\/\/|#)/;
+const COLON_POSITION_SUFFIX = /:(\d+)(?::(\d+))?$/;
+const HASH_POSITION_SUFFIX = /#L(\d+)(?:C(\d+))?(?:-L?\d+(?:C\d+)?)?$/i;
+
+export interface WorkspaceFileCitation {
+  path: string;
+  line: number | null;
+  column?: number;
+  hasPosition: boolean;
+}
+
+/** Splits the line target from a local-file citation, preserving its path. */
+export function splitWorkspaceFileCitation(text: string): WorkspaceFileCitation {
+  const match = text.match(COLON_POSITION_SUFFIX) ?? text.match(HASH_POSITION_SUFFIX);
+  if (!match || match.index === undefined) return { path: text, line: null, hasPosition: false };
+  const line = Number(match[1]);
+  const column = Number(match[2]);
+  return {
+    path: text.slice(0, match.index),
+    line: Number.isSafeInteger(line) && line > 0 ? line : null,
+    ...(Number.isSafeInteger(column) && column > 0 ? { column } : {}),
+    hasPosition: true,
+  };
+}
 
 // Where a file link's href is parked once the path moves to the data
 // attribute. Must be a *named* fragment: harden passes a fragment-only href
@@ -63,6 +86,44 @@ interface HastElement {
 // keep new-tab opening plus referrer/reverse-tabnabbing protection without the
 // extra confirmation click.
 export const CHAT_LINK_SAFETY: LinkSafetyConfig = { enabled: false };
+
+/** Rewrites safe local `file:` URIs before sanitization removes their hrefs. */
+export function rewriteFileUriLinks() {
+  return (tree: HastElement) => {
+    visitElements(tree, (node) => {
+      if (node.tagName !== "a") return;
+      const href = node.properties?.href;
+      if (typeof href !== "string" || !/^file:/i.test(href)) return;
+      const path = fileUriToLocalPath(href);
+      if (!path) return;
+      node.properties = { ...node.properties, href: path };
+    });
+  };
+}
+
+/** Returns a local absolute path only when rewriting preserves href meaning. */
+function fileUriToLocalPath(href: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(href);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "file:" || url.hostname || url.search) return null;
+  let path: string;
+  try {
+    path = decodeURIComponent(url.pathname);
+  } catch {
+    return null;
+  }
+  // Keep the rewritten href absolute without introducing URL delimiters.
+  if (!path.startsWith("/") || path.startsWith("//") || path === "/" || /[?#]/.test(path)) {
+    return null;
+  }
+  if (!url.hash) return path;
+  const cited = splitWorkspaceFileCitation(`${path}${url.hash}`);
+  return cited.hasPosition ? `${path}${url.hash}` : null;
+}
 
 /**
  * Moves the href of every file-path link onto {@link WORKSPACE_FILE_LINK_ATTR}
@@ -88,7 +149,9 @@ export function markWorkspaceFileLinks() {
       if (node.tagName !== "a") return;
       const href = node.properties?.href;
       if (typeof href !== "string" || !href) return;
-      if (NON_FILE_HREF.test(href) || href.includes("?") || href.includes("#")) return;
+      if (NON_FILE_HREF.test(href) || href.includes("?")) return;
+      const cited = splitWorkspaceFileCitation(href);
+      if (href.includes("#") && !cited.hasPosition) return;
       node.properties = {
         ...node.properties,
         href: PARKED_FILE_HREF,
@@ -122,8 +185,15 @@ function isHardenOptions(value: unknown): value is StreamdownHardenOptions {
 
 function createStreamdownRehypePlugins(markFileLinks: boolean): StreamdownRehypePlugins {
   const plugins: StreamdownRehypePlugins = [];
+  let sawSanitize = false;
 
   for (const [key, plugin] of Object.entries(defaultRehypePlugins)) {
+    // Preserve local file URIs before sanitize removes their href.
+    if (key === "sanitize") {
+      sawSanitize = true;
+      if (markFileLinks) plugins.push(rewriteFileUriLinks);
+    }
+
     if (key !== "harden") {
       plugins.push(plugin);
       continue;
@@ -144,6 +214,10 @@ function createStreamdownRehypePlugins(markFileLinks: boolean): StreamdownRehype
       plugin[0],
       { ...plugin[1], allowedImagePrefixes: [] },
     ] satisfies StreamdownPluginTuple);
+  }
+
+  if (markFileLinks && !sawSanitize) {
+    throw new Error("Streamdown default rehype plugins carry no sanitize step");
   }
 
   return plugins;

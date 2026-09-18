@@ -9,11 +9,14 @@ import {
   writeCustomTheme,
 } from "./customTheme";
 import { PALETTES } from "./themePalette";
+import { setEmbedRoot, setEmbedScopeRoot } from "./host";
 
 const STORAGE_KEY = "omnigent:custom-theme";
 
 afterEach(() => {
   localStorage.clear();
+  setEmbedScopeRoot(null);
+  setEmbedRoot(null);
   document.documentElement.removeAttribute("data-custom-translucent-sidebar");
   for (const property of Array.from(document.documentElement.style)) {
     if (property.startsWith("--custom-")) {
@@ -111,6 +114,48 @@ describe("customTheme", () => {
     expect(deriveCustomTheme({ ...theme, contrast: 50 })).toEqual(palette.tokens);
   });
 
+  it.each(PALETTES)("tints $label's selection with a custom accent", (palette) => {
+    for (const accent of ["#2563eb", "#777777", "#f59e0b"]) {
+      const variants = deriveCustomTheme({
+        ...createCustomThemeFromPalette(palette),
+        accent,
+        darkAccent: accent,
+        contrast: 100,
+        translucentSidebar: true,
+      });
+      const [r, g, b] = [1, 3, 5].map((offset) =>
+        Number.parseInt(accent.slice(offset, offset + 2), 16),
+      );
+
+      for (const mode of ["light", "dark"] as const) {
+        // The wash keeps the stock alpha for this palette and mode.
+        const alpha = /, ([\d.]+)\)$/.exec(palette.tokens[mode].selectionBackground)?.[1] ?? "0.12";
+        expect(variants[mode].selectionBackground).toBe(`rgba(${r}, ${g}, ${b}, ${alpha})`);
+        expect(variants[mode].selectionForeground).toBe(variants[mode].foreground);
+      }
+    }
+  });
+
+  it("keeps Omnigent's selection tint after contrast changes", () => {
+    const theme = createCustomThemeFromPalette(PALETTES[0]);
+    const variants = deriveCustomTheme({ ...theme, contrast: 53 });
+
+    expect(variants.light.selectionBackground).toBe("rgba(240, 1, 150, 0.1)");
+    expect(variants.light.selectionForeground).toBe("#651249");
+    expect(variants.dark.selectionBackground).toBe("rgba(240, 1, 150, 0.15)");
+    expect(variants.dark.selectionForeground).toBe("#f9a8d4");
+  });
+
+  it("tints the text selection with a custom accent, like the sidebar's active row", () => {
+    const theme = createCustomThemeFromPalette(PALETTES[0]);
+    const variants = deriveCustomTheme({ ...theme, accent: "#2563eb", darkAccent: "#f59e0b" });
+
+    expect(variants.light.selectionBackground).toBe("rgba(37, 99, 235, 0.1)");
+    expect(variants.dark.selectionBackground).toBe("rgba(245, 158, 11, 0.15)");
+    expect(variants.light.selectionForeground).toBe(variants.light.foreground);
+    expect(variants.dark.selectionForeground).toBe(variants.dark.foreground);
+  });
+
   it("keeps Omnigent's selected-session colors after contrast changes", () => {
     const theme = createCustomThemeFromPalette(PALETTES[0]);
     const variants = deriveCustomTheme({ ...theme, contrast: 53 });
@@ -119,6 +164,25 @@ describe("customTheme", () => {
     expect(variants.light.sidebarActiveForeground).toBe("#651249");
     expect(variants.dark.sidebarActive).toBe("rgba(240, 1, 150, 0.15)");
     expect(variants.dark.sidebarActiveForeground).toBe("#f472b6");
+  });
+
+  it("tints the sidebar active highlight with a custom accent", () => {
+    const theme = createCustomThemeFromPalette(PALETTES[0]);
+    const variants = deriveCustomTheme({
+      ...theme,
+      accent: "#2563eb",
+      darkAccent: "#f59e0b",
+    });
+
+    // Background tracks the accent at low alpha, in both modes.
+    expect(variants.light.sidebarActive).toBe("rgba(37, 99, 235, 0.12)");
+    expect(variants.dark.sidebarActive).toBe("rgba(245, 158, 11, 0.12)");
+
+    // Foreground reuses the rebased sidebar foreground (the default token
+    // model's `var(--sidebar-foreground)`), so it stays legible whatever
+    // format the base sidebar uses — not a hex-only-parser white fallback.
+    expect(variants.light.sidebarActiveForeground).toBe(variants.light.sidebarForeground);
+    expect(variants.dark.sidebarActiveForeground).toBe(variants.dark.sidebarForeground);
   });
 
   it.each(PALETTES)("keeps the exact $label preview at contrast 50", (palette) => {
@@ -219,5 +283,29 @@ describe("customTheme", () => {
     expect(style.getPropertyValue("--custom-light-sidebar")).toMatch(/^rgba\(/);
     expect(style.getPropertyValue("--custom-dark-sidebar")).toMatch(/^rgba\(/);
     expect(document.documentElement).toHaveAttribute("data-custom-translucent-sidebar");
+  });
+
+  it("targets the embed roots when embedded (vars on scope root, attr on both)", () => {
+    // Embedded, the `--custom-*` vars go on the scope root (inherited by the
+    // inner `.dark` root); the translucent attribute goes on BOTH roots so the
+    // light `:root[...]` and dark `.dark[...]` selectors each match.
+    const scope = document.createElement("div");
+    const inner = document.createElement("div");
+    setEmbedScopeRoot(scope);
+    setEmbedRoot(inner);
+    applyCustomTheme({
+      basePalette: "omni",
+      accent: "#2563eb",
+      darkAccent: "#2563eb",
+      tint: "#dbeafe",
+      darkTint: "#160e24",
+      contrast: 60,
+      translucentSidebar: true,
+    });
+    expect(scope.style.getPropertyValue("--custom-dark-background")).toBe("#160e24");
+    expect(scope).toHaveAttribute("data-custom-translucent-sidebar");
+    expect(inner).toHaveAttribute("data-custom-translucent-sidebar");
+    expect(document.documentElement.style.getPropertyValue("--custom-dark-background")).toBe("");
+    expect(document.documentElement).not.toHaveAttribute("data-custom-translucent-sidebar");
   });
 });
