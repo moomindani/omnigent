@@ -32,11 +32,15 @@ from omnigent.entities import (
     ConversationItem,
     NewConversationItem,
 )
-from omnigent.env_credentials import expand_envvars_with_omnigent_prefix
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import (
+    ErrorCode,
+    OmnigentError,
+    StaleCursorError,
+    restart_on_stale_cursor,
+)
 from omnigent.llms import Client as LLMClient
-from omnigent.model_catalog import resolve_catalog_model
-from omnigent.model_resolver import ModelResolutionError
+from omnigent.models.model_catalog import resolve_catalog_model
+from omnigent.models.model_resolver import ModelResolutionError
 from omnigent.onboarding.databricks_config import (
     get_workspace_url_for_profile,
 )
@@ -47,8 +51,10 @@ from omnigent.onboarding.detected import (
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     BEDROCK_KIND,
+    CHAT_WIRE_API,
     CLI_CONFIG_KIND,
     DATABRICKS_KIND,
+    KEY_KIND,
     OPENAI_FAMILY,
     RESPONSES_WIRE_API,
     SUBSCRIPTION_KIND,
@@ -86,6 +92,7 @@ from omnigent.spec.types import (
     RetryPolicy,
 )
 from omnigent.stores import ConversationStore
+from omnigent.util.env_credentials import expand_envvars_with_omnigent_prefix
 
 # ── Module-level constants ────────────────────────────────────
 
@@ -438,7 +445,7 @@ _HARNESS_DATABRICKS_PROFILE: dict[AgentHarnessType, str] = {
     # NB: no ``antigravity`` — it has no Databricks/gateway path (Gemini-native).
     # NB: no ``kimi`` — upstream kimi has no per-spawn provider override flag,
     # so Omnigent cannot thread a Databricks gateway through. Users configure
-    # providers via ``kimi provider add`` in ``~/.kimi/config.toml``
+    # providers via ``kimi provider add`` in ``~/.kimi-code/config.toml``
     # (Omnigent-side provider injection is a deferred follow-up).
 }
 
@@ -563,7 +570,7 @@ def configure_agent_harness_with_provider(
         )
     if entry.kind == BEDROCK_KIND:
         # Bedrock mode is wired only into the native ``omnigent claude`` launch
-        # (:func:`omnigent.claude_native._bedrock_config_for_native_claude`),
+        # (:func:`omnigent.harnesses.claude_native.main._bedrock_config_for_native_claude`),
         # which sets CLAUDE_CODE_USE_BEDROCK + AWS_BEARER_TOKEN_BEDROCK directly.
         # The in-process / gateway harnesses have no Bedrock path, so emitting
         # the generic ``HARNESS_*_GATEWAY_*`` vars would silently point the
@@ -741,8 +748,18 @@ def _apply_provider_family(
     :param harness_type: ``"claude-sdk"`` or ``"codex"``.
     :param family: The resolved provider family for this harness.
     :raises OmnigentError: If no model is resolvable (neither the spec nor
-        the family declares one).
+        the family declares one), or if a Codex provider is configured for
+        the unsupported Chat Completions wire API.
     """
+    if harness_type == "codex" and family.wire_api == CHAT_WIRE_API:
+        raise OmnigentError(
+            "The 'codex' harness requires an OpenAI Responses API endpoint, but "
+            f"provider endpoint {family.base_url!r} is configured with "
+            "'wire_api: chat'. Choose a Responses-capable endpoint and set "
+            "'wire_api: responses', or use a harness that supports Chat Completions.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
     cfg = _UCODE_HARNESS_CONFIGS[harness_type]
     env[_HARNESS_GATEWAY_FLAG[harness_type]] = "true"
     env[cfg.base_url_key] = family.base_url
@@ -902,7 +919,7 @@ def _apply_cli_config_databricks_to_pi(env: dict[str, str], entry: ProviderEntry
     (:func:`default_provider_for_harness`), so when that default is a
     ``cli-config`` Databricks AI Gateway, this path must route it rather than
     fail loud. We reuse the pi-native translation
-    (:func:`omnigent.pi_native_credentials._cli_config_pi_provider`) — which
+    (:func:`omnigent.harnesses.pi_native.credentials._cli_config_pi_provider`) — which
     reads the codex ``[model_providers.X]`` transport, rewrites the base URL to
     the gateway's Anthropic Messages surface (``/anthropic``) Pi speaks
     natively, and builds the per-request bearer-token ``!command`` apiKey — then
@@ -920,7 +937,7 @@ def _apply_cli_config_databricks_to_pi(env: dict[str, str], entry: ProviderEntry
     """
     # Imported lazily: pi_native_credentials is on the runner's session-create
     # hot path and pulls onboarding-only deps; keep this off workflow import.
-    from omnigent.pi_native_credentials import _cli_config_pi_provider
+    from omnigent.harnesses.pi_native.credentials import _cli_config_pi_provider
 
     # The spec model (if any) is already in HARNESS_PI_MODEL; thread it so the
     # gateway translation honors an explicit override, else its default.
@@ -992,6 +1009,27 @@ def _legacy_databricks_provider(
     return None
 
 
+def _synthesize_codex_api_key_provider(auth: ApiKeyAuth) -> ProviderEntry:
+    """Route a resolved inline key through Codex's provider transport.
+
+    :param auth: Spec or global API-key authentication, including its endpoint.
+    :returns: An in-memory OpenAI-compatible provider; never persisted.
+    """
+    return ProviderEntry(
+        name="api_key",
+        kind=KEY_KIND,
+        families={
+            OPENAI_FAMILY: FamilyConfig(
+                base_url=auth.base_url or "https://api.openai.com/v1",
+                # ApiKeyAuth is already resolved; family lookup must not
+                # expand literal dollar signs in the secret a second time.
+                auth_command=f"printf %s {shlex.quote(auth.api_key)}",
+                wire_api=RESPONSES_WIRE_API,
+            )
+        },
+    )
+
+
 def _resolve_provider_for_build(
     spec: AgentSpec,
     *,
@@ -1014,8 +1052,9 @@ def _resolve_provider_for_build(
        (no per-builder ``else``). Folded only ``for_launch`` of a gateway-flag
        harness; elsewhere it returns ``None`` so the readout / native /
        openai-agents paths keep their own handling.
-    3. An :class:`ApiKeyAuth` (spec or global) → ``None`` (the claude-sdk /
-       openai-agents builders thread the key themselves).
+    3. An :class:`ApiKeyAuth` (spec or global) → a synthesized key provider
+       for a Codex launch; otherwise ``None`` (the claude-sdk / openai-agents
+       builders thread the key themselves).
     4. The per-family global default (``providers: … default: true``), then an
        ambient-detected default.
     5. (``for_launch`` only) the first credential that can serve the family even
@@ -1057,6 +1096,8 @@ def _resolve_provider_for_build(
             auth.profile or None, harness_type=harness_type, for_launch=for_launch
         )
     if auth is not None:
+        if isinstance(auth, ApiKeyAuth) and for_launch and harness_type == "codex":
+            return _synthesize_codex_api_key_provider(auth)
         # ApiKeyAuth — threaded by the claude-sdk / openai-agents builders.
         return None
     legacy_profile = spec.executor.profile or spec.executor.config.get("profile")
@@ -1079,6 +1120,8 @@ def _resolve_provider_for_build(
             global_auth.profile or None, harness_type=harness_type, for_launch=for_launch
         )
     if global_auth is not None:
+        if isinstance(global_auth, ApiKeyAuth) and for_launch and harness_type == "codex":
+            return _synthesize_codex_api_key_provider(global_auth)
         # Global ApiKeyAuth — threaded by the builder's global-auth branch.
         return None
     model = _resolve_spec_model(spec)
@@ -1174,7 +1217,10 @@ def _build_claude_sdk_spawn_env(
     env: dict[str, str] = {}
     model = _resolve_spec_model(spec)
     if model is not None:
-        env["HARNESS_CLAUDE_SDK_MODEL"] = model
+        # Specs may pin the provider-routed spelling ("anthropic/<name>") so
+        # generic clients route correctly, but the claude CLI rejects
+        # vendor-prefixed model ids — hand it the bare name.
+        env["HARNESS_CLAUDE_SDK_MODEL"] = model.removeprefix("anthropic/")
     # Session workspace (the selected working folder), not the bundle workdir.
     # Without this the SDK subprocess inherits the runner's launch cwd — see
     # ``HARNESS_CLAUDE_SDK_CWD`` in ``omnigent/inner/claude_sdk_harness.py``.
@@ -1515,6 +1561,7 @@ def _build_acp_cli_spawn_env(
     harness: str,
     cwd: Path | None = None,
     workdir: Path | None = None,
+    session_id: str | None = None,
 ) -> dict[str, str]:
     """Build the generic-ACP env for one builtin ACP CLI harness (catalog row).
 
@@ -1549,6 +1596,10 @@ def _build_acp_cli_spawn_env(
     env = {
         "HARNESS_ACP_COMMAND": shlex.join([executable, *row.args]),
         "HARNESS_ACP_NAME": row.label,
+        # Rows whose CLI doesn't yet support session-scoped MCP and ignores
+        # session/new mcpServers (e.g. jcode) opt out of advertising the
+        # Omnigent MCP server.
+        "HARNESS_ACP_OMNIGENT_MCP": "1" if row.omnigent_mcp else "0",
     }
     # Session workspace (selected working folder). ``None`` lets the wrap fall
     # back to OMNIGENT_RUNNER_WORKSPACE — see HARNESS_ACP_CWD.
@@ -1563,6 +1614,30 @@ def _build_acp_cli_spawn_env(
     permission_mode = spec.executor.config.get("permission_mode")
     if permission_mode is not None:
         env["HARNESS_ACP_PERMISSION_MODE"] = str(permission_mode)
+
+    # Managed-connect support for jcode: point it at a session-private JCODE_HOME
+    # (with a config.toml pinning the gateway provider) + a fresh broker bearer. A
+    # no-op when not connected (connect_jcode_gateway_env returns None), and — like the
+    # other connect harnesses — suppressed when the spec configures its own API key, so
+    # an explicit key is never silently rerouted through the owner's gateway.
+    if harness == "jcode":
+        from omnigent.host.databricks_credential import api_key_auth_precludes_broker
+        from omnigent.host.jcode_databricks import connect_jcode_gateway_env
+
+        gateway_env = (
+            None
+            if api_key_auth_precludes_broker(spec)
+            else connect_jcode_gateway_env(session_id=session_id)
+        )
+        if gateway_env is not None:
+            env.update(gateway_env)
+            # The ACP wrap forwards only passthrough-named vars to the jcode subprocess,
+            # so name every managed-connect var (JCODE_DBX_TOKEN / JCODE_HOME /
+            # JCODE_RUNTIME_DIR). Preserve any existing value, dedupe, and join.
+            existing = env.get("HARNESS_ACP_ENV_PASSTHROUGH", "").split(",")
+            names = {n.strip() for n in existing if n.strip()} | set(gateway_env)
+            env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(sorted(names))
+
     return env
 
 
@@ -1599,6 +1674,12 @@ def _build_acp_spawn_env(
 
     # Lazily import the config reader — the hot spawn-env path shouldn't pull in
     # the onboarding/config stack eagerly (mirrors the cursor builder).
+    # Also lazy: model_catalog pulls the onboarding provider config eagerly.
+    from omnigent.models.model_catalog import (
+        _acp_launch_model,
+        acp_curated_models,
+        validate_acp_model,
+    )
     from omnigent.onboarding.acp_auth import (
         AcpAgentEntry,
         acp_agents,
@@ -1666,13 +1747,27 @@ def _build_acp_spawn_env(
             # Names only; the harness reads each value from its own environment.
             env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(agent.env_passthrough)
 
-        model = _resolve_spec_model(spec)
-        if model is not None and not model.startswith(("databricks-", "databricks/")):
+        model = _acp_launch_model(spec)
+        validate_acp_model(spec, model)
+        if model is not None:
             env["HARNESS_ACP_MODEL"] = model
-        elif agent.model:
-            env["HARNESS_ACP_MODEL"] = agent.model
     # else: no agent configured — leave HARNESS_ACP_COMMAND unset so the wrap
     # raises a clear request-time error pointing the user at `omnigent setup`.
+
+    # The approved catalog is independent of the selected model.
+    curated = acp_curated_models(spec)
+    if curated:
+        env["HARNESS_ACP_MODEL_LIST"] = ",".join(curated)
+
+    # Credential vars the operator declared off-limits for generic ACP agents.
+    # The vendor CLI activates built-in providers on the mere presence of
+    # their credential (any value), flooding its own picker with entries that
+    # bypass the deployment's curated set. Names are forwarded (never values);
+    # the harness reads each from its own environment before spawning the CLI.
+    # Unset means no scrubbing, matching pi-native's OMNIGENT_PI_ENV_UNSET.
+    denylist = os.environ.get("OMNIGENT_ACP_ENV_UNSET", "").strip()
+    if denylist:
+        env["HARNESS_ACP_ENV_UNSET"] = denylist
 
     # Session workspace (selected working folder). ``None`` lets the acp
     # harness fall back to OMNIGENT_RUNNER_WORKSPACE — see HARNESS_ACP_CWD.
@@ -1984,7 +2079,7 @@ def _build_kimi_spawn_env(
     The upstream Kimi Code CLI has no per-spawn provider override flag
     (no ``--config-file`` / ``--mcp-config-file``), so this builder
     only threads the model, working directory, and ``os_env`` sandbox
-    spec. Provider routing for kimi lives in ``~/.kimi/config.toml``
+    spec. Provider routing for kimi lives in ``~/.kimi-code/config.toml``
     and is managed out-of-band via ``kimi provider add``. Unlike the
     sibling builders, ``_build_kimi_spawn_env`` never calls
     :func:`configure_agent_harness_with_provider` (there is no env-var
@@ -2014,7 +2109,8 @@ def _build_kimi_spawn_env(
             "auth injection: upstream kimi has no per-spawn config override "
             "(no ``--config-file`` / ``--mcp-config-file``). Remove "
             "``executor.auth`` from the spec and configure the provider once "
-            "via `kimi provider add` in ~/.kimi/config.toml, then pin the "
+            "via `kimi provider add` in $KIMI_CODE_HOME/config.toml (default "
+            "~/.kimi-code/config.toml), then pin the "
             "resulting model id in the agent spec. Omnigent-side provider "
             "injection is a deferred follow-up.",
             code=ErrorCode.INVALID_INPUT,
@@ -2417,7 +2513,7 @@ def _prepare_messages(
             content_cache,
             session_id=conversation_id,
         )
-    messages = history_to_input_items(resolved)
+    messages = history_to_input_items(resolved, preserve_framework_notices=True)
     sys_tokens = count_tokens(
         [{"role": "system", "content": sys_instructions}],
         compaction_state.model,
@@ -2431,6 +2527,7 @@ def _prepare_messages(
 # ── Pagination helper ─────────────────────────────────────
 
 
+@restart_on_stale_cursor
 def fetch_all_items(
     conv_store: ConversationStore,
     conversation_id: str,
@@ -2439,7 +2536,15 @@ def fetch_all_items(
     """
     Fetch all conversation items starting after the given
     cursor, paginating through every page until ``has_more``
-    is ``False``.
+    is ``False``. An item cursor invalidated mid-walk restarts
+    the walk (via :func:`restart_on_stale_cursor`) instead of
+    silently dropping the remaining items.
+
+    The restart only recovers a cursor this function derived
+    itself. A caller-supplied ``after`` that is already gone
+    would be re-issued unchanged by every attempt, so it
+    raises — the caller decides what a missing anchor means
+    for its own read.
 
     :param conv_store: The ConversationStore to query.
     :param conversation_id: The conversation to fetch items
@@ -2448,6 +2553,8 @@ def fetch_all_items(
         to fetch from the beginning.
     :returns: All items in chronological order after the
         cursor.
+    :raises StaleCursorError: If ``after`` names an item that
+        no longer exists.
     """
     all_items: list[ConversationItem] = []
     cursor = after
@@ -2667,11 +2774,28 @@ def _load_initial_history(
     # The compaction item may be appended after additional output
     # items that the summary does not cover — using last_item_id
     # ensures those post-summary items are included.
-    recent_items = fetch_all_items(
-        conv_store,
-        conversation_id,
-        after=compaction_item.data.last_item_id,
-    )
+    try:
+        recent_items = fetch_all_items(
+            conv_store,
+            conversation_id,
+            after=compaction_item.data.last_item_id,
+        )
+    except StaleCursorError:
+        # The anchor was deleted, so "everything after it" is unrecoverable.
+        # Reload the whole conversation, as a structurally broken compaction
+        # item does above: a superset beats a prompt starved of history.
+        _logger.warning(
+            "Compaction anchor %r for %s no longer exists; loading full history",
+            last_id,
+            conversation_id,
+        )
+        return _LoadedHistory(
+            items=[
+                item
+                for item in fetch_all_items(conv_store, conversation_id)
+                if item.type not in NON_CONTENT_ITEM_TYPES
+            ]
+        )
     # Filter metadata items — they are not conversation content the
     # LLM should receive verbatim.
     content_items = [i for i in recent_items if i.type not in NON_CONTENT_ITEM_TYPES]

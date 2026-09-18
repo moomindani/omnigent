@@ -7,6 +7,7 @@ import {
   type PaletteTokens,
   type ThemePalette,
 } from "./themePalette";
+import { getStyleRoot, getThemeRoots } from "./host";
 
 const STORAGE_KEY = "omnigent:custom-theme";
 const HEX_COLOR = /^#[0-9a-f]{6}$/i;
@@ -331,6 +332,26 @@ function generateCustomTheme(theme: CustomTheme): GeneratedCustomTheme {
   };
 }
 
+/**
+ * A custom accent tints the selection the way it tints the sidebar's active
+ * row: a wash of the accent, at the stock wash's alpha, under the page
+ * foreground. With the accent unchanged, each palette keeps its stock wash.
+ */
+function rebaseSelection(
+  base: PaletteTokens,
+  primary: string | null,
+  foreground: string,
+): Pick<PaletteTokens, "selectionBackground" | "selectionForeground"> {
+  if (primary === null) {
+    return {
+      selectionBackground: base.selectionBackground,
+      selectionForeground: base.selectionForeground,
+    };
+  }
+  const alpha = parseCssColor(base.selectionBackground)?.alpha ?? 0.12;
+  return { selectionBackground: setAlpha(primary, alpha), selectionForeground: foreground };
+}
+
 function rebaseVariant(
   base: PaletteTokens,
   reference: GeneratedThemeVariant,
@@ -366,6 +387,7 @@ function rebaseVariant(
     ),
     primary: primaryChanged ? primary : base.primary,
     primaryForeground: primaryChanged ? readableForeground(primary) : base.primaryForeground,
+    ...rebaseSelection(base, primaryChanged ? primary : null, foreground),
     secondary: rebaseColor(base.secondary, reference.secondary, current.secondary),
     secondaryForeground: rebaseColor(
       base.secondaryForeground,
@@ -409,8 +431,14 @@ function rebaseVariant(
     ),
     sidebarBorder: rebaseColor(base.sidebarBorder, reference.border, current.border),
     sidebarRing: primaryChanged ? primary : base.sidebarRing,
-    sidebarActive: base.sidebarActive,
-    sidebarActiveForeground: base.sidebarActiveForeground,
+    // Tint the active-row highlight with the accent so it tracks a custom
+    // accent color; keep the hand-tuned base tint when the accent is unchanged.
+    // The rebased sidebar foreground stays legible on the low-alpha tint and
+    // mirrors the default token model's `var(--sidebar-foreground)`.
+    sidebarActive: primaryChanged ? setAlpha(primary, 0.12) : base.sidebarActive,
+    sidebarActiveForeground: primaryChanged
+      ? rebaseColor(base.sidebarForeground, reference.foreground, current.foreground)
+      : base.sidebarActiveForeground,
     sidebarBackground: base.sidebarBackground,
     shellBackground: base.shellBackground,
   };
@@ -472,14 +500,19 @@ export function customThemeSwatches(theme: CustomTheme): {
 }
 
 export function applyCustomTheme(theme: CustomTheme): void {
-  if (typeof document === "undefined") return;
+  // The `--custom-*` variables go on the style root (embedded, the scope root;
+  // else the document root); the `data-custom-translucent-sidebar` attribute
+  // goes on every theme root so both the light `:root[...]` and dark `.dark[...]`
+  // selectors match. Standalone both are the document root, so behavior is the
+  // same as before.
+  const styleRoot = getStyleRoot();
+  if (!styleRoot) return;
   const normalized = normalizeTheme(theme) ?? DEFAULT_CUSTOM_THEME;
   const variants = deriveCustomTheme(normalized);
-  const style = document.documentElement.style;
-  document.documentElement.toggleAttribute(
-    "data-custom-translucent-sidebar",
-    normalized.translucentSidebar,
-  );
+  const style = styleRoot.style;
+  for (const root of getThemeRoots()) {
+    root.toggleAttribute("data-custom-translucent-sidebar", normalized.translucentSidebar);
+  }
   for (const mode of ["light", "dark"] as const) {
     for (const [key, token] of Object.entries(PALETTE_TOKEN_CSS_NAMES) as [
       keyof DerivedThemeVariant,

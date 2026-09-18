@@ -10,6 +10,8 @@
 //   Existing comments highlight the lines they span. Clicking inside a
 //   highlighted range navigates to that comment in CommentsPanel.
 
+import type { FilePosition } from "./FileViewerContext";
+import { isFilePositionPending } from "./filePositionState";
 import { createPortal } from "react-dom";
 import {
   isValidElement,
@@ -36,15 +38,16 @@ import { useChatStore } from "@/store/chatStore";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import type { BundledLanguage, ThemedToken } from "shiki";
 import { highlightCode } from "@/components/ai-elements/code-block";
+import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import ReactMarkdown, { type Components, type Options } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkEmoji from "remark-emoji";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { rehypeGithubAlerts } from "rehype-github-alerts";
-import { mermaid } from "@streamdown/mermaid";
-import { MarkdownErrorBoundary } from "@/components/ai-elements/MarkdownErrorBoundary";
-import { Streamdown } from "streamdown";
+import rehypeSlug from "rehype-slug";
+import { createMathPlugin } from "@streamdown/math";
+import { MermaidPreview } from "./MermaidPreview";
 import type { Comment } from "@/hooks/useComments";
 import {
   type FileContentResponse,
@@ -72,9 +75,11 @@ import { useScrollRestore } from "./useScrollRestore";
 import { PreviewSearchBar } from "./PreviewSearchBar";
 import { renderLineTokens } from "./codeViewerRendering";
 import { HtmlCommentViewer } from "./HtmlCommentViewer";
+import { PreviewCommentBanner } from "./PreviewCommentBanner";
 import { TruncatedBanner } from "./TruncatedBanner";
 import { useLightbox } from "@/components/ImageLightbox";
 import { getEmbedRoot } from "@/lib/host";
+import { MarkdownTableOfContents } from "./MarkdownTableOfContents";
 
 // Monaco is heavy (~MBs + worker); load it only when a non-markdown file is
 // actually viewed, so the initial bundle and markdown/preview paths don't pay
@@ -100,10 +105,16 @@ const ModelViewer = lazy(() => import("./ModelViewer").then((m) => ({ default: m
 const GUTTER_WIDTH = 48;
 const EMPTY_COMMENTS: Comment[] = [];
 
+// Same TeX math config as chat (see streamdown-security.ts): only `$$…$$` opens
+// math so a lone `$` stays prose. Wraps remark-math + rehype-katex, whose plugin
+// tuples slot straight into react-markdown, so the preview renders formulas the
+// way the chat surface already does.
+const MATH_PLUGIN = createMathPlugin({ singleDollarTextMath: false });
+
 // GFM covers tables, task lists, strikethrough, and autolinks; remark-emoji
 // renders GitHub-style `:shortcode:` emoji as their unicode glyphs so docs read
-// the same here as on GitHub.
-const MARKDOWN_REMARK_PLUGINS = [remarkGfm, remarkEmoji];
+// the same here as on GitHub. remark-math parses `$$…$$` into math nodes.
+const MARKDOWN_REMARK_PLUGINS = [remarkGfm, remarkEmoji, MATH_PLUGIN.remarkPlugin];
 
 // rehype-github-alerts turns `> [!NOTE]` blockquotes into GitHub's
 // `<div class="markdown-alert markdown-alert-note">…` callout markup (GFM
@@ -117,13 +128,19 @@ const ALERT_TITLE_CLASS = /^markdown-alert-title$/;
 // on the alert wrapper div (markdown-alert*) and its title p (markdown-alert-
 // title) only for those exact tokens. Everything else — <script>, event
 // handlers, javascript: URLs, arbitrary classes — is still stripped, so raw
-// HTML in a .md file stays safe to render inline.
+// HTML in a .md file stays safe to render inline. Keep hast-util-sanitize's
+// default `clobberPrefix: "user-content-"`: heading IDs derive from untrusted
+// markdown (rehype-slug), and the prefix keeps them from clobbering named DOM
+// access or app-owned ids. The TOC reads `el.id` off the rendered DOM, so it
+// works regardless of the prefix.
+// Allow common img attributes (alt, width, height, align, valign) that GitHub supports.
 const MARKDOWN_SANITIZE_SCHEMA = {
   ...defaultSchema,
   attributes: {
     ...defaultSchema.attributes,
     div: [...(defaultSchema.attributes?.div ?? []), ["className", ALERT_CLASS]],
     p: [...(defaultSchema.attributes?.p ?? []), ["className", ALERT_TITLE_CLASS]],
+    img: [...(defaultSchema.attributes?.img ?? []), "alt", "width", "height", "align", "valign"],
   },
 };
 
@@ -132,27 +149,19 @@ const MARKDOWN_SANITIZE_SCHEMA = {
 // drops by default, showing the escaped tags as literal text. rehype-raw parses
 // that HTML; rehype-sanitize then strips anything unsafe (<script>, event
 // handlers, javascript: URLs) so this stays safe to render inline without an
-// iframe. Order matters: alerts transform before sanitize, and sanitize runs
-// last, after raw parsing and GFM.
+// iframe. Order matters: alerts transform before sanitize, slug adds IDs to
+// headings, and sanitize runs after raw parsing and GFM — only KaTeX comes
+// later, rendering math from the already-sanitized tree.
 const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
   rehypeRaw,
+  rehypeSlug,
   rehypeGithubAlerts,
   [rehypeSanitize, MARKDOWN_SANITIZE_SCHEMA],
+  // After sanitize: sanitize neutralises the untrusted markdown/HTML, leaving the
+  // `language-math` code nodes as plain text; KaTeX then renders that trusted
+  // output. Running KaTeX before sanitize would strip its MathML/spans as unknown.
+  MATH_PLUGIN.rehypePlugin,
 ];
-
-const MERMAID_STREAMDOWN_PLUGINS = { mermaid };
-
-function MermaidPreview({ source }: { source: string }) {
-  return (
-    <div data-testid="mermaid-preview" className="not-prose my-4 overflow-auto">
-      <MarkdownErrorBoundary source={source}>
-        <Streamdown plugins={MERMAID_STREAMDOWN_PLUGINS}>
-          {`\`\`\`mermaid\n${source.replace(/\n$/, "")}\n\`\`\``}
-        </Streamdown>
-      </MarkdownErrorBoundary>
-    </div>
-  );
-}
 
 // Tailwind Preflight applies `img { height: auto }`, which overrides the HTML
 // `width`/`height` *attributes* (presentational hints lose to any author CSS).
@@ -165,7 +174,9 @@ const MARKDOWN_COMPONENTS: Components = {
     const child = isValidElement(children) ? children : null;
     if (
       isValidElement<{ className?: string; children?: ReactNode }>(child) &&
-      child.props.className?.split(/\s+/).includes("language-mermaid")
+      // Match case-insensitively so a cased fence (```Mermaid) renders a diagram
+      // in the read-only preview too, matching the editor's detection.
+      child.props.className?.split(/\s+/).some((c) => c.toLowerCase() === "language-mermaid")
     ) {
       return <MermaidPreview source={String(child.props.children ?? "")} />;
     }
@@ -187,25 +198,45 @@ function MarkdownPreview({
   content,
   rootRef,
   onScroll,
+  tocOpen,
+  onTocOpenChange,
 }: {
   content: string;
   rootRef?: RefObject<HTMLDivElement | null>;
   onScroll?: (event: UIEvent<HTMLElement>) => void;
+  tocOpen: boolean;
+  onTocOpenChange: (open: boolean) => void;
 }) {
+  // Rewrite explicit TeX delimiters (`\(…\)`, `\[…\]`) to `$$…$$` before
+  // rendering, the same as chat, so agent-authored formulas render here too;
+  // remark-math only honours `$` delimiters. Safe outside code/existing math.
+  const rendered = useMemo(() => normalizeExplicitMathDelimiters(content), [content]);
   return (
-    <div
-      ref={rootRef}
-      data-preview-scroll
-      onScroll={onScroll}
-      className="markdown-preview px-6 py-4 overflow-auto h-full prose dark:prose-invert prose-sm max-w-none"
-    >
-      <ReactMarkdown
-        remarkPlugins={MARKDOWN_REMARK_PLUGINS}
-        rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
-        components={MARKDOWN_COMPONENTS}
+    <div className="flex h-full">
+      <div
+        ref={rootRef}
+        data-preview-scroll
+        onScroll={onScroll}
+        className="markdown-preview flex-1 px-6 py-4 overflow-auto prose dark:prose-invert prose-sm max-w-none"
       >
-        {content}
-      </ReactMarkdown>
+        <ReactMarkdown
+          remarkPlugins={MARKDOWN_REMARK_PLUGINS}
+          rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
+          components={MARKDOWN_COMPONENTS}
+        >
+          {rendered}
+        </ReactMarkdown>
+      </div>
+      {tocOpen && (
+        <aside className="w-64 shrink-0">
+          <MarkdownTableOfContents
+            content={content}
+            containerRef={rootRef}
+            open={tocOpen}
+            onClose={() => onTocOpenChange(false)}
+          />
+        </aside>
+      )}
     </div>
   );
 }
@@ -223,6 +254,9 @@ function PreviewWithSearch({
   searchInputRef,
   scrollKey,
   scrollReady,
+  tocOpen,
+  onTocOpenChange,
+  commentHint,
 }: {
   content: string;
   isNotebook: boolean;
@@ -234,6 +268,14 @@ function PreviewWithSearch({
   scrollKey: string | null;
   /** True once the file content backing the preview is present. */
   scrollReady: boolean;
+  tocOpen: boolean;
+  onTocOpenChange: (open: boolean) => void;
+  /**
+   * When present, shows a banner pointing users at the editor for commenting
+   * (the rendered preview can't anchor text-selection comments). Omitted for
+   * notebooks, which have no comment surface.
+   */
+  commentHint?: { conversationId: string; onSwitchToEdit: () => void };
 }) {
   const previewRef = useRef<HTMLDivElement>(null);
   // The preview div (not the FileViewer content area) is the real scroller
@@ -251,7 +293,13 @@ function PreviewWithSearch({
   const preview = isNotebook ? (
     <NotebookPreview content={content} rootRef={previewRef} onScroll={handleScroll} />
   ) : (
-    <MarkdownPreview content={content} rootRef={previewRef} onScroll={handleScroll} />
+    <MarkdownPreview
+      content={content}
+      rootRef={previewRef}
+      onScroll={handleScroll}
+      tocOpen={tocOpen}
+      onTocOpenChange={onTocOpenChange}
+    />
   );
   // The find bar sits above the preview; a truncated preview also shows the
   // banner. The bar renders nothing when closed, so layout is unchanged then.
@@ -259,6 +307,14 @@ function PreviewWithSearch({
     <div className="flex h-full flex-col">
       {bar}
       {truncated && <TruncatedBanner />}
+      {/* A truncated file can't be edited (or commented on) in the editor
+          either, so the hint would send the user to a dead end — suppress it. */}
+      {commentHint && !truncated && (
+        <PreviewCommentBanner
+          conversationId={commentHint.conversationId}
+          onSwitchToEdit={commentHint.onSwitchToEdit}
+        />
+      )}
       <div className="min-h-0 flex-1">{preview}</div>
     </div>
   );
@@ -340,6 +396,7 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
 // ---------------------------------------------------------------------------
 
 export interface CodeViewerProps {
+  position?: FilePosition;
   conversationId: string;
   path: string;
   fileQuery: ReturnType<typeof useFileContent>;
@@ -370,9 +427,20 @@ export interface CodeViewerProps {
   onSaveStatusChange?: (status: SaveStatus) => void;
   /** Forwarded to MarkdownRichTextViewer → MarkdownCommentPlugin. */
   pendingBodyRef?: RefObject<string>;
+  /** Whether the TOC panel is open (for markdown preview). */
+  tocOpen?: boolean;
+  /** Callback to toggle TOC panel. */
+  onTocToggle?: () => void;
+  /**
+   * Switches a markdown file to the rich-text editor. When set, the rendered
+   * preview shows a banner pointing users there for commenting (the preview
+   * itself can't anchor text-selection comments).
+   */
+  onRequestEditMode?: () => void;
 }
 
 export function CodeViewer({
+  position,
   conversationId,
   path,
   fileQuery,
@@ -388,6 +456,9 @@ export function CodeViewer({
   onDirtyChange,
   onSaveStatusChange,
   pendingBodyRef,
+  tocOpen = false,
+  onTocToggle,
+  onRequestEditMode,
 }: CodeViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const activeCommentId = activeSelection?.comment_id;
@@ -442,6 +513,24 @@ export function CodeViewer({
   const showMonaco = lang !== "markdown" && viewMode !== "preview";
   // Only the Shiki DOM path needs the per-line split; skip it in Monaco mode.
   const rawLines = useMemo(() => (showMonaco ? [] : content.split("\n")), [content, showMonaco]);
+
+  const revealedPositionRef = useRef<FilePosition | undefined>(undefined);
+  useEffect(() => {
+    if (
+      !position ||
+      !isFilePositionPending(position) ||
+      showMonaco ||
+      viewMode !== "source" ||
+      !fileQuery.isSuccess
+    )
+      return;
+    if (revealedPositionRef.current === position) return;
+    const index = Math.min(Math.max(1, position.line), rawLines.length) - 1;
+    const line = matchLineRefs.current.get(index);
+    if (!line) return;
+    line.scrollIntoView({ block: "center" });
+    revealedPositionRef.current = position;
+  }, [position, showMonaco, viewMode, fileQuery.isSuccess, rawLines]);
 
   // "Attach to agent" delivers a "[Attached: path:start-end]" marker the
   // composer reads — only the native coding-agent harnesses act on it, so
@@ -763,16 +852,24 @@ export function CodeViewer({
   }
 
   if (viewMode === "preview" && (lang === "markdown" || isNotebookPath(path))) {
+    const isNotebook = isNotebookPath(path);
     return (
       <PreviewWithSearch
         content={content}
-        isNotebook={isNotebookPath(path)}
+        isNotebook={isNotebook}
         truncated={truncated}
         searchOpen={searchOpen}
         onSearchHandled={handleSearchHandled}
         searchInputRef={searchInputRef}
         scrollKey={conversationId && path ? `viewer-preview:${conversationId}:${path}` : null}
         scrollReady={fileQuery.data !== undefined}
+        tocOpen={tocOpen}
+        onTocOpenChange={(open) => !open && onTocToggle?.()}
+        commentHint={
+          !isNotebook && onRequestEditMode
+            ? { conversationId, onSwitchToEdit: onRequestEditMode }
+            : undefined
+        }
       />
     );
   }
@@ -787,6 +884,7 @@ export function CodeViewer({
         }
       >
         <MonacoCodeEditor
+          position={position}
           content={content}
           conversationId={conversationId}
           path={path}
@@ -944,7 +1042,12 @@ export function CodeViewer({
                 if (el) matchLineRefs.current.set(idx, el);
                 else matchLineRefs.current.delete(idx);
               }}
-              className={cn(isCurrentMatch && "bg-yellow-200/40 dark:bg-yellow-700/30")}
+              className={cn(
+                (isCurrentMatch ||
+                  (position &&
+                    lineNum === Math.min(Math.max(1, position.line), rawLines.length))) &&
+                  "bg-yellow-200/40 dark:bg-yellow-700/30",
+              )}
             >
               <div className="flex items-stretch">
                 {/* Gutter — line number; MessageCircleIcon when a comment starts here */}

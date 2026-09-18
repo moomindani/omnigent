@@ -35,24 +35,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias, cast
 
-from omnigent import _native_forwarder_health as native_forwarder_health
-from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary
-from omnigent.codex_model_vocabulary import (
+from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
+from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.models import model_catalog
+from omnigent.models.codex_model_vocabulary import (
     EXTENDED_CATALOG_MODELS,
     EXTENDED_MODEL_DEFAULT_EFFORT,
     EXTENDED_MODEL_EFFORTS,
 )
-from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
-from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
-from omnigent.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
+from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
+from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.spec.types import RetryPolicy
+from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 
 from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport
 from .async_utils import run_sync_on_thread
 from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
+from .codex_goal_command import goal_objective_length_error as _goal_objective_length_error
 from .databricks_executor import (
     _databricks_gateway_host,
 )
@@ -84,6 +85,7 @@ logger = logging.getLogger(__name__)
 # Not Databricks-specific: the same fallback applies to any gateway producer
 # (Databricks AI gateway or a generic key/gateway provider).
 _GATEWAY_AUTH_REFRESH_MS = 900_000
+_GATEWAY_AUTH_TIMEOUT_MS = 15_000
 
 # ---------------------------------------------------------------------------
 # Type aliases for JSON-shaped Codex App Server boundaries
@@ -133,7 +135,10 @@ _STREAM_READ_CHUNK_SIZE = 65536
 # to running sessions without any action from Omnigent. ``.credentials.json``
 # is codex's OAuth store for remote (``url =``) MCP servers; without it a
 # private home starts those servers unauthenticated while stdio ones work.
-_CODEX_HOME_SYMLINK_FILES = ("auth.json", ".credentials.json")
+# ``memories_1.sqlite`` is Codex's memories database; without it a private
+# home starts with no memories and past-conversation context is lost. The ``_1``
+# suffix is Codex's schema version — update if Codex migrates to a newer schema.
+_CODEX_HOME_SYMLINK_FILES = ("auth.json", ".credentials.json", "memories_1.sqlite")
 _CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md", "hooks.json")
 # Name of the hooks file inside a CODEX_HOME. Symlinked from the user's home
 # by default; generated as a merged regular file when subagent routing is on.
@@ -156,6 +161,10 @@ _CODEX_HOME_SYMLINK_DIRS = (
     # Cross-process lock guarding ``.credentials.json``; shared so a token
     # refresh in one session cannot race another into a stale refresh token.
     Path("mcp-oauth-locks"),
+    # Memories directory and user-defined rules: symlinked so sessions see the
+    # same memories and rules as the real home without replicating them.
+    Path("memories"),
+    Path("rules"),
 )
 _CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 _CODEX_PROVIDER_CONFIG_PREFIX = "model_providers."
@@ -266,6 +275,112 @@ def _extract_codex_last_turn_usage(params: object, model: str | None) -> dict[st
     if model:
         usage["model"] = model
     return usage
+
+
+def _extract_codex_thread_total_usage(params: object) -> dict[str, int] | None:
+    """Extract the raw cumulative counters from a ``thread/tokenUsage/updated``
+    payload's ``total`` breakdown.
+
+    Codex's ``tokenUsage.total`` is cumulative across the whole thread (the
+    CLI subtracts prior totals to recover per-turn deltas), unlike ``last``,
+    which covers only the latest model request. Returns the raw counters so
+    the session can diff them against the previous turn boundary.
+
+    :param params: Codex ``thread/tokenUsage/updated`` params.
+    :returns: The raw cumulative counters, or ``None`` when the payload has
+        no usable ``total`` breakdown (caller falls back to ``last``).
+    """
+    if not isinstance(params, dict):
+        return None
+    token_usage = params.get("tokenUsage")
+    if not isinstance(token_usage, dict):
+        return None
+    total = token_usage.get("total")
+    if not isinstance(total, dict):
+        return None
+    if not any(
+        isinstance(total.get(key), int) for key in ("inputTokens", "outputTokens", "totalTokens")
+    ):
+        return None
+    return {
+        "inputTokens": int(total.get("inputTokens") or 0),
+        "cachedInputTokens": int(total.get("cachedInputTokens") or 0),
+        "outputTokens": int(total.get("outputTokens") or 0),
+        "totalTokens": int(total.get("totalTokens") or 0),
+    }
+
+
+def _codex_turn_usage_from_totals(
+    latest: dict[str, int],
+    baseline: dict[str, int] | None,
+    model: str | None,
+) -> dict[str, object]:
+    """Map the growth of the thread's cumulative counters since the last turn
+    boundary onto the wire shape that :class:`TurnComplete` consumes.
+
+    A turn that spans several model requests (model -> tool -> model -> final)
+    emits one ``thread/tokenUsage/updated`` per request, and ``last`` covers
+    only the newest request — so the turn's usage is the delta of the
+    cumulative ``total`` counters instead. Deltas clamp at zero so a counter
+    reset can never report negative usage. Cached tokens split out of
+    ``input_tokens`` exactly as in :func:`_extract_codex_last_turn_usage`.
+
+    :param latest: Raw cumulative counters from the newest usage update.
+    :param baseline: Raw cumulative counters consumed at the previous turn
+        boundary, or ``None`` for the thread's first turn.
+    :param model: The resolved model, stamped as ``"model"`` (see
+        :func:`_extract_codex_last_turn_usage`).
+    """
+
+    def _delta(key: str) -> int:
+        prior = baseline.get(key, 0) if baseline else 0
+        return max(latest.get(key, 0) - prior, 0)
+
+    input_total = _delta("inputTokens")
+    cached = min(_delta("cachedInputTokens"), input_total)
+    usage: dict[str, object] = {
+        "input_tokens": input_total - cached,
+        "output_tokens": _delta("outputTokens"),
+        "total_tokens": _delta("totalTokens"),
+    }
+    if cached:
+        usage["cache_read_input_tokens"] = cached
+    if model:
+        usage["model"] = model
+    return usage
+
+
+def _extract_codex_context_tokens(params: object) -> int | None:
+    """Window-fill snapshot from a ``thread/tokenUsage/updated`` payload's
+    ``last`` breakdown: the size of the latest model request, the proxy for
+    how full the context window is going into the next one.
+
+    Reported as ``context_tokens`` — a per-update snapshot the occupancy
+    meter reads (server-side it pairs with the model's catalog window to
+    size the ring). It is never summed across a turn and is distinct from
+    the billing ``total_tokens``, which on the cumulative-delta path is a
+    turn total, not window fill. ``last.totalTokens`` already covers input
+    (inclusive of cached, which still occupies the window) plus output;
+    recompute from components when the provider omits it. Mirrors
+    ``pi_executor``'s last-call context split.
+
+    :param params: Codex ``thread/tokenUsage/updated`` params.
+    :returns: The window-fill token count, or ``None`` when the payload has
+        no usable ``last`` breakdown.
+    """
+    if not isinstance(params, dict):
+        return None
+    token_usage = params.get("tokenUsage")
+    if not isinstance(token_usage, dict):
+        return None
+    last = token_usage.get("last")
+    if not isinstance(last, dict):
+        return None
+    total = int(last.get("totalTokens") or 0)
+    if total > 0:
+        return total
+    recomputed = int(last.get("inputTokens") or 0) + int(last.get("outputTokens") or 0)
+    return recomputed or None
 
 
 def _format_codex_error_params(params: object) -> str:
@@ -490,22 +605,48 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
     codex signals back out of it, so those names have to survive the filter
     (see :data:`_CODEX_OMNIGENT_LAUNCH_ENV_VARS`).
 
+    Resource attributes retain deployment metadata and identify these launches
+    with ``launch_mode=omni``. Exporter endpoints and credentials remain filtered;
+    Codex's own telemetry configuration controls whether and where it exports.
+
     :returns: Filtered environment dict.
     """
-    return clean_agent_env(
+    env = clean_agent_env(
         allow_prefixes=("OPENAI_", "REQUESTS_", "CODEX_HOME"),
         allow_exact=(
             "PYTHONUTF8",
+            "OTEL_RESOURCE_ATTRIBUTES",
             "DATABRICKS_BEARER",  # explicit CI/integration bearer used by auth.command
             "DATABRICKS_CODEX_TOKEN",  # env_key in ~/.codex/config.toml's DB provider
+            # Service-principal M2M credentials, so a Databricks-gateway
+            # ``auth.command`` can mint an OAuth token from the SP on each
+            # refresh. Only DATABRICKS_BEARER survived before, forcing a
+            # pre-minted (expiring) token or an inlined secret; these let the
+            # standard client-credentials mint work on a non-interactive host.
+            # DATABRICKS_CONFIG_PROFILE / DATABRICKS_TOKEN are deliberately NOT
+            # here (they stay host secrets, gated behind env_passthrough).
+            "DATABRICKS_CLIENT_ID",
+            "DATABRICKS_CLIENT_SECRET",
             *_CODEX_OMNIGENT_LAUNCH_ENV_VARS,
         ),
         deny_exact=_CODEX_ENV_DENY_EXACT,
         extra_allowed=extra_allow,
     )
+    resource_attributes = [
+        attribute
+        for attribute in env.get("OTEL_RESOURCE_ATTRIBUTES", "").split(",")
+        if attribute.strip() and attribute.partition("=")[0].strip() != "launch_mode"
+    ]
+    env["OTEL_RESOURCE_ATTRIBUTES"] = ",".join([*resource_attributes, "launch_mode=omni"])
+    return env
 
 
-def codex_skill_sources(bundle_dir: Path | None, home: Path) -> list[Path]:
+def codex_skill_sources(
+    bundle_dir: Path | None,
+    home: Path,
+    *,
+    codex_home: Path | None = None,
+) -> list[Path]:
     """
     Build the ordered Codex skill-source list: bundle skills, then host skills.
 
@@ -514,18 +655,24 @@ def codex_skill_sources(bundle_dir: Path | None, home: Path) -> list[Path]:
     ``$CODEX_HOME/skills/``) and the slash-command menu's ``codex_host_skills``
     provider — so the linked set and the menu cannot drift on which roots
     are scanned. Priority order: the agent's own ``<bundle>/skills/`` before
-    host-installed ``<home>/.codex/skills/`` (a bundled skill shadows a host
-    skill of the same name). Only existing directories are returned.
+    the host-installed skills dir (a bundled skill shadows a host skill of
+    the same name). Only existing directories are returned.
 
     :param bundle_dir: Materialized agent-bundle root, or ``None``.
     :param home: The user home directory (``Path.home()``); injected so
-        tests and the menu provider can pin it.
+        tests and the menu provider can pin it. The host skills dir defaults
+        to ``<home>/.codex/skills``.
+    :param codex_home: When set, the resolved Codex home whose ``skills/`` is
+        the host source instead of ``<home>/.codex/skills``. Codex honors
+        ``$CODEX_HOME`` for its config, so the native launch passes the
+        resolved home here to keep the seeded skills and the menu in step with
+        the CLI's own ``$CODEX_HOME``.
     :returns: Existing skill-dir roots in priority order.
     """
     sources: list[Path] = []
     if bundle_dir is not None and (bundle_dir / "skills").is_dir():
         sources.append(bundle_dir / "skills")
-    host = home / ".codex" / "skills"
+    host = (codex_home if codex_home is not None else home / ".codex") / "skills"
     if host.is_dir():
         sources.append(host)
     return sources
@@ -655,6 +802,8 @@ def populate_codex_skills_from_bundle(
     codex_home: Path,
     bundle_dir: Path | None,
     skills_filter: str | list[str],
+    *,
+    source_codex_home: Path | None = None,
 ) -> None:
     """
     Populate a CODEX_HOME's ``skills/`` from a bundle + host skills.
@@ -662,10 +811,9 @@ def populate_codex_skills_from_bundle(
     Shared by the wrapped ``codex`` executor and the ``codex-native``
     launch path so both expose the same skill surface. Builds the source
     list in priority order — the agent's own ``<bundle>/skills/`` before
-    host-installed ``~/.codex/skills/`` (so a bundled skill shadows a
-    host skill of the same name) — and delegates to
-    :func:`_populate_codex_skills`, which honours ``skills_filter``
-    (``"all"`` / ``"none"`` / list of names).
+    the host skills dir (so a bundled skill shadows a host skill of the same
+    name) — and delegates to :func:`_populate_codex_skills`, which honours
+    ``skills_filter`` (``"all"`` / ``"none"`` / list of names).
 
     :param codex_home: The CODEX_HOME whose ``skills/`` subdir Codex
         scans, e.g. a per-conversation temp dir or the per-bridge native
@@ -676,9 +824,13 @@ def populate_codex_skills_from_bundle(
         first (highest-priority) source when present.
     :param skills_filter: The spec's ``skills_filter``: ``"all"`` /
         ``"none"`` / a list of skill names.
+    :param source_codex_home: When set, the resolved host Codex home to read
+        skills from instead of ``~/.codex``. The native launch passes the
+        ``$CODEX_HOME``-resolved home so the seeded skills match what the CLI
+        loads; the wrapped executor omits it and keeps ``~/.codex``.
     :returns: None.
     """
-    skill_sources = codex_skill_sources(bundle_dir, Path.home())
+    skill_sources = codex_skill_sources(bundle_dir, Path.home(), codex_home=source_codex_home)
     _populate_codex_skills(codex_home / "skills", skills_filter, skill_sources)
 
 
@@ -784,6 +936,7 @@ def _populate_codex_home_config(
     minimal_config: bool | None = None,
     inject_hooks: bool = False,
     extend_model_catalog: bool = False,
+    supported_efforts: frozenset[str] = CODEX_EFFORTS,
 ) -> None:
     """
     Bridge user config files from the real ``CODEX_HOME`` into the temp one.
@@ -797,6 +950,8 @@ def _populate_codex_home_config(
 
     - ``auth.json`` is **symlinked** so OAuth token refreshes written to
       the real home propagate to running sessions without delay.
+    - ``memories_1.sqlite`` is **symlinked** so sessions can read memories
+      generated by the background memory pipeline from prior conversations.
     - ``config.toml`` is **copied** so an in-TUI ``/model`` command writes
       only to the session's own private copy and never mutates the shared
       ``~/.codex/config.toml``. This keeps model selection and cost-policy
@@ -808,6 +963,8 @@ def _populate_codex_home_config(
       trust keys reference.
     - ``AGENTS.md``, ``AGENTS.override.md`` are **symlinked** so instructions
       are respected.
+    - ``memories/`` and ``rules/`` are **symlinked** so file-based memories
+      and user-defined rules are visible in each session.
 
     :param target_dir: The per-conversation temp ``CODEX_HOME``
         directory. Must already exist.
@@ -904,7 +1061,7 @@ def _populate_codex_home_config(
             continue
         shutil.copy2(source_file, dest_path)
         if filename == "config.toml":
-            _normalize_copied_codex_effort(dest_path)
+            _normalize_copied_codex_effort(dest_path, supported_efforts=supported_efforts)
             if extend_model_catalog:
                 # Routed turns and spawns can land on an arm codex's bundled
                 # catalog has no entry for, which it then refuses client-side.
@@ -918,6 +1075,8 @@ def _populate_codex_home_config(
 def materialize_codex_provider_config(
     codex_home: Path,
     config_overrides: Iterable[str],
+    *,
+    retry_policy: RetryPolicy | None = None,
 ) -> list[str]:
     """Move generated provider definitions into a private Codex config.
 
@@ -928,6 +1087,8 @@ def materialize_codex_provider_config(
 
     :param codex_home: Private session ``CODEX_HOME`` directory.
     :param config_overrides: Pending Codex config override strings.
+    :param retry_policy: Omnigent retry policy to apply through Codex's native
+        provider settings. ``None`` uses :class:`RetryPolicy` defaults.
     :returns: Overrides safe to retain in subprocess arguments.
     """
     codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -941,9 +1102,9 @@ def materialize_codex_provider_config(
             provider_overrides.append(override)
         else:
             argv_overrides.append(override)
-    if not provider_overrides:
-        if config_path.is_file() and not config_path.is_symlink():
-            os.chmod(config_path, 0o600)
+    if not provider_overrides and not config_path.is_file():
+        return argv_overrides
+    if not provider_overrides and config_path.is_symlink():
         return argv_overrides
 
     import tomlkit
@@ -951,6 +1112,10 @@ def materialize_codex_provider_config(
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     document = tomlkit.parse(existing) if existing else tomlkit.document()
     providers = document.get("model_providers")
+    if providers is None and not provider_overrides:
+        if config_path.is_file() and not config_path.is_symlink():
+            os.chmod(config_path, 0o600)
+        return argv_overrides
     if providers is None:
         document["model_providers"] = tomlkit.table()
         providers = document["model_providers"]
@@ -964,6 +1129,21 @@ def materialize_codex_provider_config(
             raise ValueError("Codex provider override must define model_providers")
         for provider_name, provider_config in generated.items():
             providers[provider_name] = provider_config
+
+    policy = retry_policy if retry_policy is not None else RetryPolicy()
+    for provider_name, provider_config in list(providers.items()):
+        if not isinstance(provider_config, MutableMapping):
+            continue
+        if isinstance(provider_config, tomlkit.items.InlineTable):
+            inline_provider = tomlkit.inline_table()
+            for key, value in provider_config.items():
+                inline_provider[key] = value
+            providers[provider_name] = inline_provider
+            provider_config = inline_provider
+        provider_config["request_max_retries"] = policy.max_retries
+        provider_config["stream_max_retries"] = policy.max_retries
+        if policy.timeout_per_request_s is not None:
+            provider_config["stream_idle_timeout_ms"] = int(policy.timeout_per_request_s * 1000)
 
     fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))
     try:
@@ -1608,7 +1788,11 @@ def set_codex_model_catalog_path(config_path: Path, catalog_path: Path) -> bool:
 _EFFORT_KEY_RE = re.compile(r'^(\s*model_reasoning_effort\s*=\s*")([^"]*)("\s*(?:#.*)?)$')
 
 
-def _normalize_copied_codex_effort(config_path: Path) -> None:
+def _normalize_copied_codex_effort(
+    config_path: Path,
+    *,
+    supported_efforts: frozenset[str] = CODEX_EFFORTS,
+) -> None:
     """Rewrite a deprecated top-level ``model_reasoning_effort`` in the
     session's private copy of ``config.toml``.
 
@@ -1620,15 +1804,19 @@ def _normalize_copied_codex_effort(config_path: Path) -> None:
     verbatim into every per-session ``CODEX_HOME``, that one app-written key
     fails **every** codex turn on such machines.
 
-    Values already in :data:`CODEX_EFFORTS` are left untouched, as are
-    values with no known alias (codex surfaces its own error for those) and
-    anything below the first table header. Only the session's private copy
+    Values already in *supported_efforts* (defaults to :data:`CODEX_EFFORTS`,
+    or :data:`CODEX_NATIVE_EFFORTS` for native CLI runs) are left untouched,
+    as are values with no known alias (codex surfaces its own error for those)
+    and anything below the first table header. Only the session's private copy
     is modified — never the user's real ``~/.codex/config.toml``.
 
     :param config_path: The copied ``config.toml`` inside the per-session
         ``CODEX_HOME``. Unreadable/unwritable files are skipped (best
         effort — the copy already succeeded, so this only degrades back to
         the pre-normalization behavior).
+    :param supported_efforts: Set of effort values considered supported for
+        this session runtime (e.g. :data:`CODEX_EFFORTS` or
+        :data:`CODEX_NATIVE_EFFORTS`).
     """
     try:
         text = config_path.read_text(encoding="utf-8")
@@ -1647,7 +1835,7 @@ def _normalize_copied_codex_effort(config_path: Path) -> None:
             match = _EFFORT_KEY_RE.match(content)
             if match is not None:
                 value = match.group(2)
-                if value not in CODEX_EFFORTS:
+                if value not in supported_efforts:
                     replacement = EFFORT_ALIASES.get(value)
                     if replacement is not None:
                         line_ending = line[len(content) :]
@@ -1722,7 +1910,7 @@ def _databricks_codex_config_overrides(
             f"base_url={json.dumps(base_url)},"
             'auth={command="sh",'
             f'args=["-c",{auth_command_json}],'
-            "timeout_ms=5000,"
+            f"timeout_ms={_GATEWAY_AUTH_TIMEOUT_MS},"
             f"refresh_interval_ms={auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS}"
             "},"
             'wire_api="responses"}'
@@ -1783,7 +1971,7 @@ def _provider_codex_config_overrides(
         f"base_url={json.dumps(base_url)},"
         'auth={command="sh",'
         f'args=["-c",{auth_command_json}],'
-        "timeout_ms=5000,"
+        f"timeout_ms={_GATEWAY_AUTH_TIMEOUT_MS},"
         f"refresh_interval_ms={_GATEWAY_AUTH_REFRESH_MS}"
         "},"
         f'wire_api="{effective_wire_api}"}}'
@@ -2195,6 +2383,7 @@ class _CodexAppServerSession:
         env: dict[str, str],
         tool_executor: CodexToolExecutor | None,
         codex_config_overrides: list[str] | None = None,
+        retry_policy: RetryPolicy | None = None,
         disable_native_tools: bool = False,
         bundle_dir: Path | None = None,
         skills_filter: str | list[str] = "all",
@@ -2204,6 +2393,7 @@ class _CodexAppServerSession:
         self._env = env
         self._tool_executor = tool_executor
         self._codex_config_overrides = list(codex_config_overrides or [])
+        self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self._disable_native_tools = disable_native_tools
         self._bundle_dir = bundle_dir
         self._skills_filter = skills_filter
@@ -2238,11 +2428,17 @@ class _CodexAppServerSession:
         self._process_cwd: Path | None = None
         # Private CODEX_HOME so the subprocess never writes to the user's ~/.codex/.
         self._codex_home_dir: Path | None = None
-        # Most recent ``thread/tokenUsage/updated`` payload's ``last``
-        # turn breakdown, mapped to the wire shape. Consumed (and cleared)
-        # on the next ``turn/completed`` so each TurnComplete carries the
-        # usage for the turn that just finished.
+        # In-flight turn's usage, mapped to the wire shape: billing figures
+        # are the delta of the thread's cumulative ``tokenUsage.total``
+        # counters since the last turn boundary (``last`` covers only the
+        # latest model request, so a multi-request turn would under-report),
+        # plus a ``context_tokens`` window-fill snapshot from ``last``.
+        # Consumed (and cleared) on the next ``turn/completed``.
         self._last_turn_usage: dict[str, object] | None = None
+        # Raw cumulative ``tokenUsage.total`` counters: the newest observed
+        # values, and the snapshot consumed at the last turn boundary.
+        self._thread_usage_total_raw: dict[str, int] | None = None
+        self._thread_usage_baseline_raw: dict[str, int] | None = None
         # Serialize concurrent writes to the subprocess stdin so that parallel
         # tool-call responses don't interleave bytes on the pipe.
         self._stdin_lock = asyncio.Lock()
@@ -2313,6 +2509,7 @@ class _CodexAppServerSession:
         self._codex_config_overrides = materialize_codex_provider_config(
             self._codex_home_dir,
             self._codex_config_overrides,
+            retry_policy=self._retry_policy,
         )
         if router_bridge_dir is not None:
             write_codex_router_hooks_file(
@@ -2357,7 +2554,7 @@ class _CodexAppServerSession:
                 # App-server threads run persisted-trusted hooks only, so the
                 # routing hooks need the trust handshake to be enforced.
                 # Imported here: the app-server module imports this one.
-                from omnigent.codex_native_app_server import trust_codex_router_hooks
+                from omnigent.harnesses.codex_native.app_server import trust_codex_router_hooks
 
                 try:
                     await trust_codex_router_hooks(self._request, cwd=self._cwd or os.getcwd())
@@ -2432,6 +2629,15 @@ class _CodexAppServerSession:
         self._recent_events.append(message)
         if len(self._recent_events) > 20:
             self._recent_events.pop(0)
+
+    def _consume_turn_usage(self) -> dict[str, object] | None:
+        """Return the finished turn's usage and advance the thread baseline
+        so the next turn's delta excludes everything reported so far."""
+        usage = self._last_turn_usage
+        self._last_turn_usage = None
+        if self._thread_usage_total_raw is not None:
+            self._thread_usage_baseline_raw = self._thread_usage_total_raw
+        return usage
 
     def _format_recent_events(self) -> list[CodexParams]:
         formatted: list[CodexParams] = []
@@ -2565,10 +2771,21 @@ class _CodexAppServerSession:
             # Fresh thread: forget the prior thread's applied effort so the
             # settings update below re-sends it for this thread.
             self._applied_effort = None
+            # Fresh thread: cumulative usage counters restart at zero.
+            self._thread_usage_total_raw = None
+            self._thread_usage_baseline_raw = None
+            self._last_turn_usage = None
 
         assert self.thread_id is not None
         latest_user_content = _extract_latest_user_content(messages)
         goal_objective = _goal_objective_from_content(latest_user_content)
+        if goal_objective is not None:
+            # Reject over-long objectives here so the app-server's raw
+            # JSON-RPC -32600 error never reaches the user.
+            length_error = _goal_objective_length_error(goal_objective)
+            if length_error is not None:
+                yield ExecutorError(message=length_error)
+                return
         prompt_messages = messages
         if goal_objective is not None:
             await self._request(
@@ -2653,6 +2870,7 @@ class _CodexAppServerSession:
                 break
 
         message_buffers: dict[str, str] = {}
+        last_reasoning_item_id: str | None = None
         pending_tool_results: dict[str, _PendingToolResult] = {}
         observed_builtin_tool_ids: set[str] = set()
         completed_builtin_tool_ids: set[str] = set()
@@ -2862,6 +3080,18 @@ class _CodexAppServerSession:
                     raw_reasoning_delta = params.get("delta")
                     if not isinstance(raw_reasoning_delta, str) or not raw_reasoning_delta:
                         continue
+                    # Each reasoning paragraph streams as its own item, so a
+                    # new itemId marks a paragraph boundary. Surface it as a
+                    # reasoning_started marker: downstream reducers flush the
+                    # prior paragraph's held tail and insert a separator.
+                    raw_reasoning_item_id = params.get("itemId")
+                    if isinstance(raw_reasoning_item_id, str) and raw_reasoning_item_id:
+                        if (
+                            last_reasoning_item_id is not None
+                            and raw_reasoning_item_id != last_reasoning_item_id
+                        ):
+                            yield ReasoningChunk(delta="", event_type="reasoning_started")
+                        last_reasoning_item_id = raw_reasoning_item_id
                     yield ReasoningChunk(delta=raw_reasoning_delta, event_type="reasoning_text")
                     continue
 
@@ -2918,8 +3148,7 @@ class _CodexAppServerSession:
                                 active_turn_id,
                                 final_response[:120],
                             )
-                            turn_usage = self._last_turn_usage
-                            self._last_turn_usage = None
+                            turn_usage = self._consume_turn_usage()
                             _notify_usage_from_dict(model=model, usage=turn_usage)
                             yield TurnComplete(response=final_response, usage=turn_usage)
                             return
@@ -2932,7 +3161,24 @@ class _CodexAppServerSession:
                         continue
 
                 if method == "thread/tokenUsage/updated":
-                    self._last_turn_usage = _extract_codex_last_turn_usage(params, model)
+                    total_raw = _extract_codex_thread_total_usage(params)
+                    if total_raw is not None:
+                        self._thread_usage_total_raw = total_raw
+                        self._last_turn_usage = _codex_turn_usage_from_totals(
+                            total_raw, self._thread_usage_baseline_raw, model
+                        )
+                    else:
+                        # No cumulative breakdown — fall back to the newest
+                        # request's ``last`` (under-reports multi-request turns).
+                        self._last_turn_usage = _extract_codex_last_turn_usage(params, model)
+                    # context_tokens is window fill: a snapshot of the latest
+                    # request from ``last``, carried alongside the billing
+                    # figures so the occupancy meter reads it rather than the
+                    # summable ``total_tokens``.
+                    if self._last_turn_usage is not None:
+                        context_tokens = _extract_codex_context_tokens(params)
+                        if context_tokens is not None:
+                            self._last_turn_usage["context_tokens"] = context_tokens
                     continue
 
                 if method == "turn/completed":
@@ -2959,8 +3205,7 @@ class _CodexAppServerSession:
                             message_buffers=message_buffers,
                             final_response=final_response,
                         )
-                    turn_usage = self._last_turn_usage
-                    self._last_turn_usage = None
+                    turn_usage = self._consume_turn_usage()
                     _notify_usage_from_dict(model=model, usage=turn_usage)
                     yield TurnComplete(response=final_response, usage=turn_usage)
                     return
@@ -3212,6 +3457,7 @@ class _AppSessionFactory(Protocol):
         env: dict[str, str],
         tool_executor: CodexToolExecutor | None,
         codex_config_overrides: list[str] | None,
+        retry_policy: RetryPolicy,
         disable_native_tools: bool,
         bundle_dir: Path | None,
         skills_filter: str | list[str],
@@ -3225,6 +3471,7 @@ def _default_app_session_factory(
     env: dict[str, str],
     tool_executor: CodexToolExecutor | None,
     codex_config_overrides: list[str] | None,
+    retry_policy: RetryPolicy,
     disable_native_tools: bool,
     bundle_dir: Path | None,
     skills_filter: str | list[str],
@@ -3235,6 +3482,7 @@ def _default_app_session_factory(
         env=env,
         tool_executor=tool_executor,
         codex_config_overrides=codex_config_overrides,
+        retry_policy=retry_policy,
         disable_native_tools=disable_native_tools,
         bundle_dir=bundle_dir,
         skills_filter=skills_filter,
@@ -3555,6 +3803,7 @@ class CodexExecutor(Executor):
             env=self._env,
             tool_executor=self._tool_executor,
             codex_config_overrides=self._codex_config_overrides,
+            retry_policy=self._retry_policy,
             disable_native_tools=self._disable_native_tools,
             bundle_dir=self._bundle_dir,
             skills_filter=self._skills_filter,

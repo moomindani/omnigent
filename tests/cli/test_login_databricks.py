@@ -18,6 +18,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import click
 import httpx
 import pytest
 from click.testing import CliRunner
@@ -80,7 +81,7 @@ def _response(
     )
 
 
-@pytest.fixture()
+@pytest.fixture(autouse=True)
 def token_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Redirect auth_tokens.json and the global config to a temp dir.
 
@@ -116,7 +117,7 @@ def _patch_login_env(
     :param monkeypatch: Pytest monkeypatch fixture.
     :param fake_httpx: Scripted httpx.get replacement.
     :param sdk_installed: What ``databricks_sdk_installed()`` reports.
-    :param cached_tokens: Successive ``_databricks_workspace_token``
+    :param cached_tokens: Successive workspace auth token
         results, e.g. ``[None, "tok"]`` for "no cached grant, then a
         token after ``databricks auth login`` runs". Defaults to a
         cached token on first try.
@@ -147,11 +148,14 @@ def _patch_login_env(
         lambda: sdk_installed,
     )
     tokens = list(cached_tokens if cached_tokens is not None else ["tok-cached"])
-    monkeypatch.setattr(
-        cli_mod,
-        "_databricks_workspace_token",
-        lambda workspace_host: tokens.pop(0),
-    )
+
+    def _auth_info(workspace_host: str) -> cli_mod._DatabricksWorkspaceAuthInfo | None:
+        token = tokens.pop(0)
+        if token is None:
+            return None
+        return cli_mod._DatabricksWorkspaceAuthInfo(token=token, profile_name=None)
+
+    monkeypatch.setattr(cli_mod, "_databricks_workspace_auth_info", _auth_info)
 
     login_calls: list[str] = []
 
@@ -276,6 +280,37 @@ def test_login_account_host_inherits_cli_selected_workspace(
     assert load_databricks_workspace_host(_WORKSPACE_API_URL) == _WORKSPACE
 
 
+def test_login_workspace_hosted_uses_cli_workspace_id_without_metadata(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path
+) -> None:
+    """Workspace-hosted login can route with only the CLI profile workspace id."""
+    from omnigent.cli_auth import load_databricks_org_id, load_databricks_workspace_host
+
+    fake = _FakeHttpx(
+        responses=[
+            _response(
+                401,
+                headers={"www-authenticate": 'Bearer realm="DatabricksRealm"'},
+                body={"error_code": 401, "message": "Credential was not sent"},
+            ),
+            _response(200, body={"user_id": "alice@example.com"}),
+        ]
+    )
+    _patch_login_env(
+        monkeypatch,
+        fake_httpx=fake,
+        host_needs_selector=False,
+        default_workspace_id="1965859176160743",
+    )
+
+    result = CliRunner().invoke(cli_group, ["login", _WORKSPACE_API_URL])
+
+    assert result.exit_code == 0, result.output
+    assert fake.requests[-1]["params"] == {"o": "1965859176160743"}
+    assert load_databricks_org_id(_WORKSPACE_API_URL) == "1965859176160743"
+    assert load_databricks_workspace_host(_WORKSPACE_API_URL) == _WORKSPACE
+
+
 @pytest.mark.parametrize(
     ("account_id", "workspace_id", "expected"),
     [
@@ -304,6 +339,7 @@ def test_databricks_host_needs_org_selector_reads_discovery_metadata(
         sdk_oauth,
         "get_host_metadata",
         lambda host: SimpleNamespace(account_id=account_id, workspace_id=workspace_id),
+        raising=False,
     )
     assert cli_mod._databricks_host_needs_org_selector("https://host.example") is expected
 
@@ -317,7 +353,7 @@ def test_databricks_host_needs_org_selector_swallows_discovery_failure(
     def _boom(host: str) -> object:
         raise ValueError("no route to host")
 
-    monkeypatch.setattr(sdk_oauth, "get_host_metadata", _boom)
+    monkeypatch.setattr(sdk_oauth, "get_host_metadata", _boom, raising=False)
     assert cli_mod._databricks_host_needs_org_selector("https://host.example") is False
 
 
@@ -1218,6 +1254,11 @@ def test_resolve_server_url_strips_query_and_expands(
     resolved = cli_mod._resolve_server_url(f"{_WORKSPACE}/?o=2850744067564480")
     assert resolved.api_base == _WORKSPACE_API_URL
     assert resolved.org_id == "2850744067564480"
+    from omnigent.cli_auth import databricks_request_headers
+
+    assert databricks_request_headers(resolved.api_base)["X-Databricks-Org-Id"] == (
+        "2850744067564480"
+    )
     # The probes hit the CLEAN root/mount — never a ?o=-corrupted URL (which
     # would push the path into the query string, e.g. ``…/?o=123/v1/me``).
     assert probed and all("o=" not in url and "%2F" not in url for url in probed)
@@ -1236,7 +1277,54 @@ def test_resolve_server_url_strips_query_on_full_mount(
     resolved = cli_mod._resolve_server_url(f"{_WORKSPACE_API_URL}?o=2850744067564480")
     assert resolved.api_base == _WORKSPACE_API_URL
     assert resolved.org_id == "2850744067564480"
+    from omnigent.cli_auth import databricks_request_headers
+
+    assert databricks_request_headers(resolved.api_base)["X-Databricks-Org-Id"] == (
+        "2850744067564480"
+    )
     assert probed == []
+
+
+def test_resolve_server_url_does_not_store_selector_off_managed_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An arbitrary server query must not create managed routing state."""
+    stored: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "omnigent.cli_auth.store_databricks_org_id",
+        lambda server, org_id: stored.append((server, org_id)),
+    )
+
+    resolved = cli_mod._resolve_server_url("https://example.com/service?o=123")
+
+    assert resolved.api_base == "https://example.com/service"
+    assert resolved.org_id == "123"
+    assert stored == []
+
+
+def test_resolve_server_url_reports_selector_persistence_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A routing selector must not be silently dropped when state is unwritable."""
+
+    def fail_to_store(_server: str, _org_id: str) -> None:
+        raise PermissionError("read-only data directory")
+
+    monkeypatch.setattr(
+        cli_mod,
+        "_workspace_api_server_url",
+        lambda _server: _WORKSPACE_API_URL,
+    )
+    monkeypatch.setattr(
+        "omnigent.cli_auth.store_databricks_org_id",
+        fail_to_store,
+    )
+
+    with pytest.raises(
+        click.ClickException,
+        match="Could not persist the workspace routing selector",
+    ):
+        cli_mod._resolve_server_url(f"{_WORKSPACE}/?o=2850744067564480")
 
 
 def test_workspace_url_expands_web_ui_path_to_api_mount(

@@ -8,20 +8,22 @@ import {
 } from "react";
 import {
   ArchiveIcon,
-  CheckIcon,
+  ArchiveRestoreIcon,
   ChevronLeftIcon,
+  DownloadIcon,
   EllipsisIcon,
   FolderInputIcon,
   GitBranchIcon,
+  GitForkIcon,
   InfoIcon,
   MailIcon,
   PencilIcon,
   PinIcon,
   PinOffIcon,
-  SearchIcon,
   ShareIcon,
   Trash2Icon,
 } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -42,21 +44,25 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { useQueryClient } from "@tanstack/react-query";
+import { exportSessionTranscript } from "@/lib/sessionsApi";
+import { triggerBrowserDownload } from "@/hooks/useFileContent";
 import {
   PINNED_LABEL_KEY,
   type Conversation,
   useArchiveConversation,
   useMoveToProject,
-  useProjects,
   useRenameConversation,
   useStopAndDeleteConversation,
   useTogglePinnedConversation,
 } from "@/hooks/useConversations";
+import { ProjectPicker } from "./ProjectPicker";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { Link, useNavigate } from "@/lib/routing";
-import { showToast } from "@/components/ui/toast";
+import { useNavigate } from "@/lib/routing";
+import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
+import { showArchiveUndoToast } from "./archiveUndoToast";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { conversationDisplayLabel } from "./sidebarNav";
@@ -65,99 +71,39 @@ interface HeaderConversationMenuProps {
   conversation: Conversation;
   currentProject: string | null;
   canShare: boolean;
+  canFork: boolean;
   shareDisabled?: boolean;
   shareDisabledReason?: string;
   onShare: () => void;
+  onFork: () => void;
   hasAgentInfo?: boolean;
   onAgentInfo?: () => void;
+  /**
+   * Mobile Chat/Terminal view switch (ViewModeMenuItems) — leads the menu on
+   * terminal-first sessions and carries its own trailing separator. `null`
+   * otherwise.
+   */
+  viewItems?: ReactNode;
   /** Mobile workspace-rail entries (Files · Agents · Shells · Logs). */
   workspaceItems?: ReactNode;
-}
-
-function ArchivedToast() {
-  return (
-    <span>
-      View archived sessions in{" "}
-      <Link to="/settings/archived" className="font-medium text-primary hover:underline">
-        Settings
-      </Link>
-    </span>
-  );
-}
-
-function showArchivedToast() {
-  showToast(<ArchivedToast />);
-}
-
-function ProjectPicker({
-  currentProject,
-  onSelect,
-}: {
-  currentProject: string | null;
-  onSelect: (project: string) => void;
-}) {
-  const { data: projects = [] } = useProjects();
-  const [search, setSearch] = useState("");
-  const filtered = search
-    ? projects.filter((project) => project.name.toLowerCase().includes(search.toLowerCase()))
-    : projects;
-
-  return (
-    <>
-      <div className="flex items-center gap-2 border-b px-2 py-1.5">
-        <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
-        <input
-          aria-label="Search projects"
-          className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
-          placeholder="Search projects"
-          value={search}
-          onChange={(event) => setSearch(event.target.value)}
-          onKeyDown={(event) => event.stopPropagation()}
-        />
-      </div>
-      <div className="max-h-48 overflow-y-auto">
-        {filtered.map((project) => (
-          <DropdownMenuItem
-            key={project.name}
-            className="px-2 py-1"
-            onSelect={() => onSelect(project.name)}
-          >
-            <span className="flex-1 truncate text-left">{project.name}</span>
-            {currentProject === project.name && (
-              <CheckIcon className="size-3.5 shrink-0 text-primary" />
-            )}
-          </DropdownMenuItem>
-        ))}
-        {filtered.length === 0 && (
-          <p className="px-2 py-1.5 text-sm text-muted-foreground">No projects yet.</p>
-        )}
-      </div>
-      {currentProject && (
-        <div className="border-t pt-1">
-          <DropdownMenuItem className="px-2 py-1" onSelect={() => onSelect("")}>
-            Remove from{" "}
-            <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
-              {currentProject}
-            </span>
-          </DropdownMenuItem>
-        </div>
-      )}
-    </>
-  );
 }
 
 export function HeaderConversationMenu({
   conversation,
   currentProject,
   canShare,
+  canFork,
   shareDisabled = false,
   shareDisabledReason,
   onShare,
+  onFork,
   hasAgentInfo = false,
   onAgentInfo,
+  viewItems = null,
   workspaceItems = null,
 }: HeaderConversationMenuProps) {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const isMobile = useIsMobileViewport();
   const { trackClick } = useOmnigentAnalytics();
   const togglePinned = useTogglePinnedConversation();
@@ -173,6 +119,7 @@ export function HeaderConversationMenu({
   const [deleteBranch, setDeleteBranch] = useState(false);
   const previousConversationId = useRef(conversation.id);
   const isPinned = conversation.labels?.[PINNED_LABEL_KEY] != null;
+  const isArchived = conversation.archived === true;
   const label = conversationDisplayLabel(conversation);
   // Mobile taps need a bigger target than the dense desktop row.
   const itemClass = isMobile ? "gap-2.5 px-2.5 py-2" : undefined;
@@ -229,21 +176,45 @@ export function HeaderConversationMenu({
     });
   };
 
+  const exportConversation = async () => {
+    try {
+      const jsonl = await exportSessionTranscript(conversation.id);
+      triggerBrowserDownload(
+        new Blob([jsonl], { type: "application/jsonl" }),
+        `${conversation.id}.jsonl`,
+      );
+    } catch {
+      toast.error("Export failed");
+    }
+  };
+
   const archiveConversation = () => {
     closeMenu();
-    archive.mutate(
-      { id: conversation.id, archived: true },
-      {
-        onSuccess: () => {
-          navigate("/", { replace: true });
-          showArchivedToast();
-        },
-      },
-    );
+    if (isArchived) {
+      // Unarchiving keeps the user on the session — no redirect home and no
+      // Undo toast (mirrors the sidebar row's Unarchive).
+      archive.mutate({ id: conversation.id, archived: false });
+      return;
+    }
+    // The row leaves the sidebar optimistically (useArchiveConversation flips
+    // the cached `archived` flag in onMutate), and we're viewing the session
+    // being archived, so leave its chat surface now — synchronously, like
+    // confirmDelete — rather than in an onSuccess callback that fires a
+    // round-trip later with a stale active session.
+    navigate("/", { replace: true });
+    archive.mutate({ id: conversation.id, archived: true });
+    // Fire NOW, not in a mutate onSuccess: navigating away unmounts this menu,
+    // and per-call mutate callbacks don't fire once their observer unmounts.
+    // The Undo toast is driven by module state + the app-level Toaster, so it
+    // survives this menu unmounting.
+    showArchiveUndoToast(queryClient, [conversation]);
   };
 
   const mainItems = (
     <>
+      {/* Chat/Terminal switch leads the menu on terminal-first sessions; it
+          renders its own trailing separator (null on other sessions). */}
+      {viewItems}
       <DropdownMenuItem
         data-testid="header-pin-conversation"
         className={itemClass}
@@ -271,6 +242,24 @@ export function HeaderConversationMenu({
           Share
         </DropdownMenuItem>
       )}
+      {canFork && (
+        <DropdownMenuItem
+          data-testid="header-fork-conversation"
+          className={itemClass}
+          onSelect={onFork}
+        >
+          <GitForkIcon className="size-3.5" />
+          Fork
+        </DropdownMenuItem>
+      )}
+      <DropdownMenuItem
+        data-testid="header-export-conversation"
+        className={itemClass}
+        onSelect={() => void exportConversation()}
+      >
+        <DownloadIcon className="size-3.5" />
+        Export
+      </DropdownMenuItem>
       {hasAgentInfo && onAgentInfo && (
         <DropdownMenuItem
           data-testid="header-agent-info"
@@ -284,6 +273,9 @@ export function HeaderConversationMenu({
           Agent info
         </DropdownMenuItem>
       )}
+      {/* Rename is also reachable on desktop by clicking the breadcrumb title
+          (HeaderTitle); on mobile the native shells hide the breadcrumb, so this
+          menu is the sole entry point. */}
       <DropdownMenuItem
         data-testid="header-rename-conversation"
         className={itemClass}
@@ -300,7 +292,12 @@ export function HeaderConversationMenu({
         <MailIcon className="size-3.5" />
         Mark as unread
       </DropdownMenuItem>
+      {/* Move to project is also reachable on desktop via the breadcrumb's
+          folder tag (HeaderProjectTag); on mobile the native shells hide the
+          breadcrumb, so this menu is the sole entry point. */}
       {isMobile ? (
+        // Mobile has no room for a side flyout, so this item swaps the menu body
+        // to the project picker in place (see the `projectPickerOpen` branch).
         <DropdownMenuItem
           data-testid="header-move-to-project"
           className={cn("whitespace-nowrap", itemClass)}
@@ -321,6 +318,8 @@ export function HeaderConversationMenu({
             <FolderInputIcon className="size-3.5" />
             {currentProject ? "Move session" : "Add to project"}
           </DropdownMenuSubTrigger>
+          {/* A native submenu flyout — no separate popover layer, so no
+              open/dismiss race with the parent menu. */}
           <DropdownMenuSubContent className="min-w-56">
             <ProjectPicker currentProject={currentProject} onSelect={handleProjectSelect} />
           </DropdownMenuSubContent>
@@ -338,8 +337,12 @@ export function HeaderConversationMenu({
         className={itemClass}
         onSelect={archiveConversation}
       >
-        <ArchiveIcon className="size-3.5" />
-        Archive
+        {isArchived ? (
+          <ArchiveRestoreIcon className="size-3.5" />
+        ) : (
+          <ArchiveIcon className="size-3.5" />
+        )}
+        {isArchived ? "Unarchive" : "Archive"}
       </DropdownMenuItem>
       <DropdownMenuItem
         data-testid="header-delete-conversation"
@@ -357,6 +360,13 @@ export function HeaderConversationMenu({
     <>
       <DropdownMenu
         open={menuOpen}
+        // Radix's modal mode sets `pointer-events: none` on <body> while the
+        // menu is open, leaving the menu as the only touch target on screen.
+        // Browser touch-target adjustment then snaps outside taps near the
+        // menu onto it, so on a phone the menu can't be dismissed. Non-modal
+        // keeps the page interactive, so an outside tap lands on real content
+        // and dismisses the menu.
+        modal={!isMobile}
         onOpenChange={(open) => {
           setMenuOpen(open);
           if (!open) setProjectPickerOpen(false);
@@ -369,9 +379,9 @@ export function HeaderConversationMenu({
             size={isMobile ? "icon" : "icon-xs"}
             aria-label="Conversation actions"
             data-testid="header-conversation-actions"
-            className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:rounded-full"
+            className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:size-11 max-md:rounded-full"
           >
-            <EllipsisIcon className={isMobile ? "size-4" : "size-3.5"} />
+            <EllipsisIcon className={isMobile ? "size-5" : "size-3.5"} />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent
@@ -390,7 +400,7 @@ export function HeaderConversationMenu({
               <DropdownMenuSeparator />
             </>
           )}
-          {isMobile && projectPickerOpen ? (
+          {projectPickerOpen ? (
             <>
               <DropdownMenuItem
                 data-testid="header-project-picker-back"
@@ -423,6 +433,7 @@ export function HeaderConversationMenu({
               autoFocus
               aria-label="Session name"
               data-testid="header-rename-conversation-input"
+              maxLength={USER_SESSION_TITLE_MAX_CHARS}
               value={renameTitle}
               onChange={(event) => setRenameTitle(event.target.value)}
               onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {

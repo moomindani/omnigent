@@ -60,8 +60,11 @@ with `git worktree remove <path>` when done.
 ## What it does
 
 1. Reconstructs the user journey from the linked bug report.
-2. Drives the running app through that journey — browser tools for UI bugs,
-   `sys_session_*` / HTTP for backend bugs — until it observes the failure.
+2. Drives the running app through that journey — Playwright `tests/e2e_ui/` for
+   headless web UI runs (including CI), embedded-browser tools for local sessions
+   with a connected desktop, and `sys_session_*` / HTTP for backend bugs — until
+   it observes the failure. Headless CI does not probe or use desktop browser
+   tools, even when they appear in the tool list.
 3. Authors a durable e2e test (`tests/e2e_ui/` for UI, PTY/pexpect for CLI
    journeys, `tests/e2e/` for backend) keyed to the concrete failure, so a fix
    has a fail→pass regression guard.
@@ -71,7 +74,11 @@ with `git worktree remove <path>` when done.
    the fix step pairs with its after-fix re-recording); an already-fixed facet is
    filmed passing (proof-it-works footage). Best-effort: skipped (and noted) when
    the recorders aren't installed.
-5. Emits a single fenced ```json block (the machine-readable handoff) whose
+5. Checkpoints the machine-readable handoff to
+   `.omnigent/repro-handoff.json` as soon as the verdict is known, updating it
+   as test and recording evidence lands so an interrupted final response does
+   not lose a completed reproduction.
+6. Emits a single fenced ```json block (the machine-readable handoff) whose
    `verdict` is exactly one of `reproduced` / `not_reproduced` / `already_fixed`
    / `needs_more_info`, alongside the per-facet breakdown (each facet stamped
    with its `surface`), test path, recordings list, session id, journey, and

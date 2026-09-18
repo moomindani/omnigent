@@ -42,6 +42,7 @@ from omnigent.harness_plugins import harness_install_keys, valid_harnesses
 from omnigent.onboarding.harness_install import (
     COPILOT_KEY,
     CURSOR_KEY,
+    DEVIN_KEY,
     GOOSE_KEY,
     HERMES_KEY,
     KIMI_KEY,
@@ -73,7 +74,7 @@ from omnigent.onboarding.provider_config import (
 # / ``agents_sdk``) and the ``claude`` alias normalize onto these first.
 # ``antigravity`` is the in-process Gemini SDK harness (its key resolves at
 # runtime), distinct from the CLI-wrapping ``antigravity-native`` (``agy``)
-# harness gated below on its binary plus a file-based OAuth credential.
+# harness gated below on its binary plus an API key or OAuth credential.
 _logger = logging.getLogger(__name__)
 
 _SDK_HARNESSES: frozenset[str] = frozenset(
@@ -83,15 +84,16 @@ _SDK_HARNESSES: frozenset[str] = frozenset(
 # Families/harnesses whose CLIs authenticate via file-based credentials rather
 # than a CLI login-status command. For these, ``harness_is_configured`` checks
 # BOTH the binary (via ``harness_cli_installed``) AND the credential (via the
-# callable here). ``agy`` writes an OAuth token on its first interactive run;
-# ``kimi login`` writes ``~/.kimi-code/credentials/kimi-code.json``, and
-# pay-per-use users instead set an API key in ``~/.kimi-code/config.toml`` (kimi
-# has no login-status probe) — ``kimi_auth_configured`` accepts either. The
-# ``anthropic`` / ``openai`` families authenticate via subscription provider
-# config and do not appear here. Each lambda resolves through its module at call
-# time so a test can monkeypatch ``…gemini_auth.gemini_login_detected`` /
-# ``…kimi_auth.kimi_auth_configured`` and have the patch take effect without
-# this dict caching the old function object.
+# callable here). ``agy`` accepts ``GEMINI_API_KEY`` or writes an OAuth token on
+# its first interactive run; ``kimi login`` writes
+# ``~/.kimi-code/credentials/kimi-code.json``, and pay-per-use users instead set
+# an API key in ``~/.kimi-code/config.toml`` (kimi has no login-status probe) —
+# ``kimi_auth_configured`` accepts either. The ``anthropic`` / ``openai``
+# families authenticate via subscription provider config and do not appear here.
+# Each lambda resolves through its module at call time so a test can monkeypatch
+# ``…gemini_auth.gemini_login_detected`` / ``…kimi_auth.kimi_auth_configured``
+# and have the patch take effect without this dict caching the old function
+# object.
 _FAMILY_CREDENTIAL_CHECK: dict[str, Callable[[], bool]] = {
     GEMINI_FAMILY: lambda: _gemini_auth.gemini_login_detected(),
     KIMI_KEY: lambda: _kimi_auth.kimi_auth_configured(),
@@ -143,6 +145,14 @@ _KIMI_NATIVE_HARNESSES: frozenset[str] = frozenset({"kimi-native", "native-kimi"
 # native CLI harnesses. Hermes owns its own auth (``hermes setup`` /
 # ``hermes model``); the headless ``hermes`` harness gates on the same binary.
 _HERMES_NATIVE_HARNESSES: frozenset[str] = frozenset({"hermes-native", "native-hermes"})
+
+# Native Devin harnesses boot the resident ``devin`` TUI (``omni devin``). Devin
+# owns its own auth (``devin auth login`` writes a credential file it reads back
+# at spawn), so there is no Omnigent-managed key to gate on and readiness is
+# binary presence — like the other native CLI harnesses. Without these entries
+# they'd fail open like an unknown harness, letting a binary-less launch die
+# inside the executor.
+_DEVIN_NATIVE_HARNESSES: frozenset[str] = frozenset({"devin-native", "native-devin"})
 
 # CLI-wrapping qwen harnesses. ``qwen`` / ``qwen-code`` (the ACP harness) and
 # ``qwen-native`` / ``native-qwen`` (the native TUI via ``omni qwen``) all resolve
@@ -231,6 +241,8 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         return _installer_only_availability(GOOSE_KEY)
     if canonical in _HERMES_NATIVE_HARNESSES or canonical == HERMES_KEY:
         return _installer_only_availability(HERMES_KEY)
+    if canonical in _DEVIN_NATIVE_HARNESSES:
+        return _installer_only_availability(DEVIN_KEY)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
         # ``CURSOR_API_KEY`` (a ``cursor-agent login`` does not apply). So,
@@ -459,7 +471,7 @@ def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailab
 def _harness_availability(canonical: str) -> HarnessAvailability:
     """Return picker-facing availability for one canonical harness spelling."""
     if _is_codex_family_harness(canonical):
-        from omnigent.codex_native import _codex_auth_unavailable_reason
+        from omnigent.harnesses.codex_native.main import _codex_auth_unavailable_reason
 
         return _codex_auth_unavailable_reason() or True
     install_key = _AUTH_AWARE_NATIVE_HARNESSES.get(canonical)
@@ -470,14 +482,30 @@ def _harness_availability(canonical: str) -> HarnessAvailability:
         # warning copy uniform across every CLI-backed native harness.
         return _cli_family_availability(canonical, install_key)
     if canonical in _PI_HARNESSES:
-        # pi has no CLI login — its only credential is an omnigent-managed
-        # provider (an API key / gateway, incl. one set from the UI). So the
-        # two-step signal is binary + provider: installed-but-no-provider is
-        # the yellow "needs-auth" state the setup dialog acts on.
+        # pi has no CLI login — its only credential is either an omnigent-managed
+        # provider (an API key / gateway) or a pi-subscription ("Pi original auth",
+        # which signals "use Pi's own ~/.pi/agent as-is"). So the two-step signal
+        # is binary + provider: installed-but-no-provider is the yellow "needs-auth"
+        # state the setup dialog acts on.
         binary_state = _binary_availability_reason(PI_KEY)
         if binary_state is not True:
             return binary_state
-        return True if _family_provider_configured(PI_SURFACE) else "needs-auth"
+        if _family_provider_configured(PI_SURFACE):
+            return True
+        # A pi subscription (original auth) is also a valid configured state —
+        # it means Pi will use its own ~/.pi/agent credentials, no omnigent
+        # provider needed.
+        try:
+            provider = default_provider_for_harness(load_config(), PI_SURFACE)
+            if (
+                provider is not None
+                and provider.kind == SUBSCRIPTION_KIND
+                and provider.cli == "pi"
+            ):
+                return True
+        except Exception:
+            pass
+        return "needs-auth"
     return _harness_availability_core(canonical)
 
 
@@ -539,6 +567,7 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.update(_GOOSE_NATIVE_HARNESSES)
     spellings.update(_KIMI_NATIVE_HARNESSES)
     spellings.update(_HERMES_NATIVE_HARNESSES)
+    spellings.update(_DEVIN_NATIVE_HARNESSES)
     spellings.update(_QWEN_HARNESSES)
     spellings.add(CURSOR_KEY)
     spellings.add(KIMI_SURFACE)
