@@ -173,7 +173,8 @@ import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useHasSessionDraft } from "@/lib/sessionDrafts";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
-import { useSessionErrors } from "@/hooks/useSessionErrors";
+import { useSessionErrorStates } from "@/hooks/useSessionErrors";
+import type { LatestSessionError } from "@/lib/sessionError";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
@@ -667,17 +668,20 @@ function SidebarImpl({
     [selectionMode, exitSelectionMode],
   );
 
-  useSidebarView(activeTab);
-  const archivedQuery = useArchivedSessions(activeTab === "archived");
+  const availableTab = activeTab === "shared" && !sidebarData.sharedAvailable ? "mine" : activeTab;
+  useLayoutEffect(() => {
+    if (availableTab !== activeTab) switchTab(availableTab);
+  }, [activeTab, availableTab, switchTab]);
+
+  useSidebarView(availableTab);
+  const archivedQuery = useArchivedSessions(availableTab === "archived");
   const displayQuery: SidebarListQuery =
-    activeTab === "archived"
+    availableTab === "archived"
       ? archivedQuery
-      : activeTab === "mine"
+      : availableTab === "mine"
         ? sidebarData.mine
-        : activeTab === "shared"
-          ? sidebarData.sharedAvailable
-            ? sidebarData.shared
-            : { ...sidebarData.all, data: undefined, isLoading: false, hasNextPage: false }
+        : availableTab === "shared"
+          ? sidebarData.shared
           : sidebarData.all;
   const inboxCount = sidebarData.inboxCount;
 
@@ -1219,27 +1223,33 @@ function SidebarImpl({
                     : "[scrollbar-color:transparent_transparent] [&::-webkit-scrollbar-thumb]:bg-transparent",
                 )}
               >
-                <ConversationList
-                  conversationsQuery={displayQuery}
-                  scrollContainerRef={scrollContainerRef}
-                  onRowClick={onNavClick}
-                  searchQuery=""
-                  newSessionProjectName={newSessionProjectName}
-                  activeTab={activeTab}
-                  onActiveTabChange={switchTab}
-                  multiUser={multiUser}
-                  pinnedConversationIds={pinnedConversationIds}
-                  pinnedConversations={pinnedConversations}
-                  onTogglePinned={togglePinnedConversation}
-                  onEnterSelectionMode={enterSelectionMode}
-                  selectionMode={selectionMode}
-                  selectionScope={selectionScope}
-                  selectedIds={selectedIds}
-                  onToggleSelected={toggleSelected}
-                  onDeselectAll={deselectAll}
-                  onExitSelectionMode={exitSelectionMode}
-                  getVisibleIdsRef={getVisibleIdsRef}
-                />
+                {sidebarData.identityReady ? (
+                  <ConversationList
+                    conversationsQuery={displayQuery}
+                    scrollContainerRef={scrollContainerRef}
+                    onRowClick={onNavClick}
+                    searchQuery=""
+                    newSessionProjectName={newSessionProjectName}
+                    activeTab={availableTab}
+                    onActiveTabChange={switchTab}
+                    multiUser={multiUser}
+                    pinnedConversationIds={pinnedConversationIds}
+                    pinnedConversations={pinnedConversations}
+                    onTogglePinned={togglePinnedConversation}
+                    onEnterSelectionMode={enterSelectionMode}
+                    selectionMode={selectionMode}
+                    selectionScope={selectionScope}
+                    selectedIds={selectedIds}
+                    onToggleSelected={toggleSelected}
+                    onDeselectAll={deselectAll}
+                    onExitSelectionMode={exitSelectionMode}
+                    getVisibleIdsRef={getVisibleIdsRef}
+                  />
+                ) : (
+                  <p role="status" className="px-2 py-1 text-muted-foreground text-sm">
+                    Loading sessions…
+                  </p>
+                )}
               </nav>
               {/* Mobile: Settings floats over the bottom of the session list, with
           Search floating at the top of the header row — the two icons the
@@ -1376,7 +1386,7 @@ function ProjectFolder({
       frozenSortKeys,
     );
   }, [query.data, windowConversations, pinnedSet, activeOverride, frozenSortKeys]);
-  const errors = useSessionErrors(conversations);
+  const errors = useSessionErrorStates(conversations);
   const startingConversationId = useChatStore((s) =>
     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
   );
@@ -2589,13 +2599,14 @@ function UngroupDropZone() {
 /** Surface the most actionable state across a collapsed project's loaded rows. */
 function projectMarkerState(
   conversations: Conversation[],
-  errors: readonly boolean[],
+  errors: readonly (LatestSessionError | null)[],
   startingConversationId: string | null,
 ): SessionState | null {
   let awaiting = 0;
   let running = false;
   let starting = false;
   let error = false;
+  let disconnected = false;
   let unseen = false;
   for (const [i, c] of conversations.entries()) {
     const state = getSessionState(c, errors[i]);
@@ -2607,6 +2618,8 @@ function projectMarkerState(
       starting = true;
     } else if (state?.kind === "error") {
       error = true;
+    } else if (state?.kind === "disconnected") {
+      disconnected = true;
     } else if (isConversationUnseen(c.id, c.updated_at, c.status)) {
       unseen = true;
     }
@@ -2615,6 +2628,7 @@ function projectMarkerState(
   if (running) return { kind: "running" };
   if (starting) return { kind: "starting" };
   if (error) return { kind: "error" };
+  if (disconnected) return { kind: "disconnected" };
   if (unseen) return { kind: "unseen" };
   return null;
 }
@@ -3868,8 +3882,8 @@ function ConversationRowImpl({
   const canMarkUnread = !hasUnseenMessages;
   // Approvals and failures outrank the unread dot without clearing read state.
   const errorConversations = useMemo(() => [conversation], [conversation]);
-  const [latestMessageIsError] = useSessionErrors(errorConversations);
-  const derivedState = getSessionState(conversation, latestMessageIsError);
+  const [latestError] = useSessionErrorStates(errorConversations);
+  const derivedState = getSessionState(conversation, latestError);
   // The bound session's launch/relaunch window: a send is in flight (local
   // status "streaming") or the runner is auto-creating the PTY
   // (`terminalPending`), but the server hasn't confirmed `running` yet — a
@@ -4170,8 +4184,17 @@ function ConversationRowImpl({
     <li
       ref={setRowRef}
       data-sidebar-session-id={conversation.id}
-      onMouseDown={(event) => dragListeners?.onMouseDown?.(event)}
-      onTouchStart={(event) => dragListeners?.onTouchStart?.(event)}
+      onMouseDown={(event) => {
+        // Portaled dialogs bubble through this row but must not start a drag.
+        if (event.currentTarget.contains(event.target as Node)) {
+          dragListeners?.onMouseDown?.(event);
+        }
+      }}
+      onTouchStart={(event) => {
+        if (event.currentTarget.contains(event.target as Node)) {
+          dragListeners?.onTouchStart?.(event);
+        }
+      }}
       className={cn("group relative", isDragging && "opacity-40")}
     >
       {/* Right-click anywhere on the row opens the same actions as the kebab.

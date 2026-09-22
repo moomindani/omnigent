@@ -1776,10 +1776,10 @@ _HARNESS_COMMANDS: frozenset[str] = frozenset(
 _ACCENT_RGB = (244, 59, 166)
 
 # Command names that are pure aliases of another command (the same Click
-# object registered under a second name, e.g. ``antigravity`` -> ``agy``).
+# object registered under a second name, e.g. ``update`` -> ``upgrade``).
 # Kept runnable/registered but omitted from the ``--help`` listing so the
 # alias isn't shown as a duplicate line.
-_ALIAS_COMMANDS: frozenset[str] = frozenset({"antigravity"})
+_ALIAS_COMMANDS: frozenset[str] = frozenset({"update", "antigravity"})
 
 
 def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
@@ -1855,7 +1855,7 @@ class _OmnigentCLI(click.Group):
             cmd = self.get_command(ctx, subcommand)
             if cmd is None or cmd.hidden:
                 continue
-            # Skip pure aliases (e.g. ``antigravity`` -> ``agy``) so the
+            # Skip pure aliases (e.g. ``update`` -> ``upgrade``) so the
             # listing doesn't show a duplicate line; still runnable.
             if subcommand in _ALIAS_COMMANDS:
                 continue
@@ -2144,9 +2144,9 @@ def _should_skip_update_check(argv: list[str]) -> bool:
 
     Skipped for help / version requests, internal TUI subcommands
     (``pane-split`` / ``pane-picker``, invoked by the terminal UI rather
-    than the user), and ``upgrade`` (and its deprecated ``update`` spelling)
-    itself (pointing the user at ``omni upgrade`` while they are running it
-    is noise).
+    than the user), and ``upgrade`` (and its ``update`` alias) itself
+    (pointing the user at ``omni upgrade`` while they are running it is
+    noise).
 
     :param argv: CLI arguments without the program name, e.g.
         ``["run", "agent.yaml"]``.
@@ -4213,6 +4213,17 @@ def _assert_server_port_bindable(host: str, port: int) -> None:
         "loopback port and prints its URL."
     ),
 )
+@click.option(
+    "--base-path",
+    default=None,
+    help=(
+        "Public URL path prefix when serving behind a subpath reverse proxy, "
+        "e.g. --base-path /proxy/6767 for code-server's port proxy "
+        "(alternative to OMNIGENT_WEB_BASE_PATH). The Web UI prefixes its "
+        "API/WebSocket/asset URLs with this, and the server accepts requests "
+        "with or without the prefix. Default: served at the origin root."
+    ),
+)
 @click.pass_context
 def server(
     ctx: click.Context,
@@ -4227,6 +4238,7 @@ def server(
     auto_open: bool,
     admin_password: str | None,
     background: bool,
+    base_path: str | None,
 ) -> None:
     """Start the Omnigent server, or manage the background server.
 
@@ -4262,12 +4274,25 @@ def server(
     :param background: When True, spawn the server as a detached background
         process (the managed local server) instead of running it in the
         foreground.
+    :param base_path: Optional public URL path prefix from ``--base-path``,
+        e.g. ``"/proxy/6767"``. Folded into the ``OMNIGENT_WEB_BASE_PATH`` env
+        var that ``create_app`` reads; ``None`` leaves the env var untouched.
     :returns: None.
     """
     if ctx.invoked_subcommand is not None:
         # A subcommand (stop/status) handles this invocation; the body
         # below is the server path for the bare ``server`` group.
         return
+
+    # --base-path is sugar for OMNIGENT_WEB_BASE_PATH, which create_app reads.
+    # An env var (not a create_app kwarg) so the same toggle reaches every
+    # startup path (Docker entrypoint, canonical local server, e2e harness)
+    # that builds the app outside this command. Assigned (not setdefault) so an
+    # explicit flag wins over an inherited value and a --background reuse detects
+    # the change. Folded in before the --background branch below so a detached
+    # server (which spawns inheriting this process's environ) picks it up too.
+    if base_path:
+        os.environ["OMNIGENT_WEB_BASE_PATH"] = base_path
 
     if background:
         # `omnigent server --background` is the canonical spelling for the
@@ -5925,34 +5950,11 @@ def upgrade(
     )
 
 
-@click.pass_context
-def _update_deprecated(ctx: click.Context, **kwargs: object) -> None:
-    """Warn that ``update`` is deprecated, then run the ``upgrade`` flow.
-
-    :param ctx: The click context, used to invoke ``upgrade``.
-    :param kwargs: ``upgrade``'s own parsed options, forwarded verbatim.
-    :returns: None.
-    """
-    click.echo(
-        f"omnigent: `update` is deprecated; use `{cli_invocation(name='omni')} upgrade`.",
-        err=True,
-    )
-    ctx.invoke(upgrade, **kwargs)
-
-
-# Deprecated rather than deleted: the desktop About window shipped this same
-# ``omni update`` hint, and ``server start`` was deleted outright in v0.7.0
-# (#3105) then restored (#3578) when older clients hard-failed on it.
-cli.add_command(
-    click.Command(
-        "update",
-        params=list(upgrade.params),
-        callback=_update_deprecated,
-        hidden=True,
-        # Static: a module-level f-string would freeze the wrapper spelling.
-        help="Deprecated spelling of `upgrade`. Use `upgrade` instead.",
-    )
-)
+# ``omni update`` is an alias for ``omni upgrade`` — mistyping the latter as
+# the former is common, and silently doing nothing is annoying. Registering
+# the same Command object under a second name shares the exact callback,
+# options, and semantics; there is no duplicated implementation to drift.
+cli.add_command(upgrade, name="update")
 
 
 def _bundle(source: Path) -> bytes:
@@ -8792,9 +8794,16 @@ def _maybe_open_host_web_ui(
     if _resolve_auto_open_conversation_setting(cfg) is False:
         return
     from omnigent.conversation_browser import open_conversation_url
+    from omnigent.host.local_server import local_server_base_path
     from omnigent.util.server_url import display_server_url
 
     web_url = display_server_url(server_url)
+    # A local server started with --base-path serves the UI under that prefix;
+    # opening the bare root renders blank (BrowserRouter basename mismatch).
+    # No-op for a remote --server or an unconfigured/root local server.
+    base_path = local_server_base_path(server_url)
+    if base_path:
+        web_url = web_url.rstrip("/") + base_path
     try:
         opened = open_conversation_url(web_url)
     except OSError:
@@ -9301,6 +9310,7 @@ def _daemon_session_request_params(
     params: dict[str, str | int] = {
         "limit": 1000,
         "include_archived": "true",
+        "visibility": "all",
     }
     if connected_only:
         params["connected"] = "true"
