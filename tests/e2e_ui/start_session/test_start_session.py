@@ -774,7 +774,8 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
             composer = page.get_by_role("textbox", name="Message the agent")
             await expect(composer).to_be_editable()
             await expect(composer).to_have_attribute("placeholder", re.compile("Send a follow-up"))
-            await expect(page.get_by_role("button", name="Send", exact=True)).to_be_disabled()
+            await expect(page.get_by_role("button", name="Interrupt", exact=True)).to_be_enabled()
+            await expect(page.get_by_role("button", name="Send", exact=True)).to_have_count(0)
             await expect(
                 page.get_by_test_id("message-bubble").get_by_text("set up the project", exact=True)
             ).to_be_visible()

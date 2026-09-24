@@ -23,6 +23,7 @@ import tempfile
 import time
 import urllib.parse
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, cast, overload
@@ -328,6 +329,9 @@ for _builder_name in (
 # Servers before 0.3.0 cannot serialize the runner's "waiting" status.
 # Unknown versions also downgrade to "running" so old servers never return 500.
 _WAITING_STATUS_MIN_SERVER_VERSION = "0.3.0"
+# Published statuses that mean a session's terminal is still working a turn.
+# ``waiting`` is parked on user input, so it keeps the runner alive too.
+_IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
 # Cached server version from the /api/version probe; ``None`` until a probe
 # succeeds. A failed probe stays ``None`` and is retried on the next
 # session-create — the GET is cheap and self-heals a transient failure.
@@ -559,6 +563,11 @@ _SESSION_STREAM_HEARTBEAT_S = 15.0
 # that died on its own leaves the harness parked on a readiness wait, so the
 # wait is bounded and the stream failure is then attributed to the exit.
 _TERMINAL_EXIT_RELEASE_GRACE_S = 2.0
+
+# Banner printed by Claude Code on a voluntary /exit or /quit (exit 0).
+# The pane activity from printing it can flip the idle memo back to "running"
+# before the pane dies, making session_was_idle False on a user-initiated quit.
+_CLAUDE_VOLUNTARY_EXIT_MARKER = "Resume this session with:"
 
 # Lazy singleton LLM client for the runner process. Created on first use so
 # the runner does not import llms at startup (imports are expensive and the
@@ -2928,11 +2937,7 @@ def create_runner_app(
     _session_terminal_epochs: dict[str, int] = {}  # session_id → terminal generation
 
     def _terminal_registration_fence(session_id: str) -> Callable[[], bool]:
-        """Capture the terminal generation a launch is about to start under.
-
-        A session reset bumps the generation, so a terminal that only finishes
-        starting afterwards is holding a spec the reset retired.
-        """
+        """Check whether a launch still has this session's terminal generation."""
         epoch = _session_terminal_epochs.get(session_id, 0)
         return lambda: _session_terminal_epochs.get(session_id, 0) == epoch
 
@@ -3141,11 +3146,23 @@ def create_runner_app(
                     return True
         if pending_approvals.has_any_pending():
             return True
-        if process_manager is not None:
-            session_ids = set(_session_start_cache) | set(_session_agent_ids)
-            if any(process_manager.has_active_turn(session_id) for session_id in session_ids):
-                return True
-        return False
+        session_ids = set(_session_start_cache) | set(_session_agent_ids)
+        if process_manager is not None and any(
+            process_manager.has_active_turn(session_id) for session_id in session_ids
+        ):
+            return True
+        return any(_native_turn_in_flight(session_id) for session_id in session_ids)
+
+    def _native_turn_in_flight(session_id: str) -> bool:
+        """Whether a native terminal still reports this session's turn as in flight.
+
+        Native delivery returns once the prompt is typed, so the terminal's own
+        status edges decide when the turn settles. SDK turns are already covered
+        by ``_active_turns`` and need not publish a closing edge.
+        """
+        if _native_pane_status.get(session_id) not in _IN_FLIGHT_SESSION_STATUSES:
+            return False
+        return is_native_harness(_session_harness_name(session_id))
 
     app.state.has_active_work = _has_active_work
 
@@ -3511,8 +3528,23 @@ def create_runner_app(
         # instead of the transport error the severed socket raises.
         error = _build_required_terminal_error(event)
         _required_terminal_exit_errors[event.session_id] = error
+        # A dead required terminal cannot still be working a turn.
+        _native_pane_status.pop(event.session_id, None)
 
         if event.terminal_name in ("qwen", "antigravity") and event.session_key == "main":
+            _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
+            _release_required_terminal_session(event.session_id)
+            return
+
+        # A claude /exit or /quit prints this banner and exits 0. Printing it
+        # can flip the idle memo back to "running" before pane death, so treat
+        # a banner exit as a clean stop rather than a failure.
+        if (
+            event.exit_status == 0
+            and event.terminal_name == "claude"
+            and event.last_output is not None
+            and _CLAUDE_VOLUNTARY_EXIT_MARKER in event.last_output
+        ):
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
             _release_required_terminal_session(event.session_id)
             return
@@ -3548,6 +3580,7 @@ def create_runner_app(
     from omnigent.runtime.filesystem_registry import (
         FilesystemRegistry,
         create_filesystem_registry,
+        detect_git_root,
     )
 
     if runner_workspace is not None:
@@ -3558,6 +3591,37 @@ def create_runner_app(
     app.state.filesystem_registry = filesystem_registry
 
     _session_fs_registries: dict[str, FilesystemRegistry] = {}
+    # Roots whose search registry stays warm; bounded so distinct generated
+    # workspaces cannot accumulate for the runner's lifetime.
+    _search_fs_registries: OrderedDict[str, FilesystemRegistry] = OrderedDict()
+    _search_registry_cache_size = 8
+
+    def _search_registry_for_root(root: Path) -> FilesystemRegistry:
+        """Registry rooted at *root*, the tree a search actually walks.
+
+        The session registry watches the session's stored workspace (or the
+        runner's), which is not necessarily the environment root the search
+        walks — runner-managed sessions get a generated per-session workspace
+        no other registry covers. The repository root is re-detected on every
+        call, so a repository created or removed mid-session — including one
+        nested at the workspace root inside an outer repository — is read on
+        the next search. The registry is never started: startup
+        runs ``git update-index`` inside the repository, and a repository at a
+        generated workspace root may be the agent's own. Search needs only
+        the anchored index read.
+
+        :param root: Absolute directory the search walks.
+        :returns: A registry whose workspace root is *root*.
+        """
+        key = str(root)
+        registry = _search_fs_registries.get(key)
+        if registry is None or registry.git_root != detect_git_root(root):
+            registry = create_filesystem_registry(watch_path=root)
+            _search_fs_registries[key] = registry
+            while len(_search_fs_registries) > _search_registry_cache_size:
+                _search_fs_registries.popitem(last=False)
+        _search_fs_registries.move_to_end(key)
+        return registry
 
     async def _session_snapshot(session_id: str) -> _SessionSnapshot:
         cached = _session_snapshot_cache.get(session_id)
@@ -9987,6 +10051,9 @@ def create_runner_app(
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
             if status in ("running", "waiting", "idle", "failed"):
+                # Forwarders report these edges straight to the server, so record
+                # them here too; the idle watchdog reads them for native turns.
+                _native_pane_status[conversation_id] = status
                 resource_registry.note_external_session_status(conversation_id, status)
                 _fan_out_child_delta_to_parent(
                     conversation_id,
@@ -10700,8 +10767,7 @@ def create_runner_app(
         sandbox_override = body.get("sandbox")
         spec = body.get("spec") or {}
 
-        # Captured before spec resolution: a reset landing after this point
-        # retires the spec this launch is about to build from.
+        # Capture before spec resolution so a reset invalidates this launch.
         registration_is_current = _terminal_registration_fence(session_id)
 
         agent_spec = await _resolve_session_agent_spec(session_id)
@@ -10794,9 +10860,6 @@ def create_runner_app(
                 resource_role=(CLAUDE_NATIVE_TERMINAL_ROLE if bridge_inject else None),
             )
         except TerminalLaunchSupersededError:
-            # The registry refused the registration: a reset landed while the
-            # terminal was starting. Same contract as the fence check below,
-            # with nothing left to close.
             _logger.info(
                 "Discarding terminal %s:%s for %s: session was reset mid-launch",
                 terminal_name,
@@ -10821,8 +10884,6 @@ def create_runner_app(
             )
 
         if not registration_is_current():
-            # Same fence as the native paths: a reset that landed mid-start
-            # retired this terminal's spec, so drop it rather than attach it.
             _logger.info(
                 "Discarding terminal %s:%s for %s: session was reset mid-launch",
                 terminal_name,
@@ -11246,8 +11307,13 @@ def create_runner_app(
         exclude: str | None,
         limit: int,
     ) -> JSONResponse:
+        import asyncio as _asyncio
+
         from omnigent.runner.environment_filesystem import (
             CallerProcessFilesystem,
+            _validate_path,
+            index_search,
+            merge_entries,
             split_glob_list,
         )
 
@@ -11258,13 +11324,54 @@ def create_runner_app(
         await _ensure_session_registered(session_id)
         env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
         fs = CallerProcessFilesystem(env)
-        entries, truncated = await fs.search_files(
-            q,
-            path=path,
-            include=include_patterns,
-            exclude=exclude_patterns,
-            limit=limit,
+
+        # The budgeted walk is the only source for ignored files (and, until a
+        # ``git status`` has run, untracked ones), so it always runs. Alongside
+        # it, git's index adds every tracked file in one read however large the
+        # repo, and the Changed tab's latest ``git status`` adds untracked files
+        # past the budget. Absolute (browse-anywhere) paths have no registry.
+        walk = _asyncio.ensure_future(
+            fs.search_files(
+                q,
+                path=path,
+                include=include_patterns,
+                exclude=exclude_patterns,
+                limit=limit,
+            )
         )
+        indexed: list[FilesystemEntry] | None = None
+        try:
+            registry = None
+            if not fs._absolute(path):
+                env_root = fs._resolve("")
+                registry = await _resolve_session_fs_registry(session_id)
+                if (
+                    registry is None
+                    or registry.cwd != env_root
+                    or registry.git_root != detect_git_root(env_root)
+                ):
+                    # The session registry watches a different tree than this
+                    # walk covers, or a repository boundary moved since it was
+                    # built; either way its index would answer for the wrong
+                    # files. Consult one rooted where the search actually runs.
+                    registry = _search_registry_for_root(env_root)
+            if registry is not None:
+                indexed = await _asyncio.to_thread(
+                    index_search,
+                    registry,
+                    fs._resolve(path),
+                    _validate_path(path) if path else "",
+                    q,
+                    include=include_patterns,
+                    exclude=exclude_patterns,
+                    limit=limit,
+                )
+        except BaseException:
+            walk.cancel()
+            raise
+        entries, truncated = await walk
+        if indexed is not None:
+            entries = merge_entries(indexed, entries, limit)
         data = [_fs_entry_to_dict(e) for e in entries]
         return JSONResponse(
             status_code=200,
@@ -12299,15 +12406,9 @@ def create_runner_app(
         return JSONResponse(status_code=200, content=payload)
 
     def _fs_entry_to_dict(entry: FilesystemEntry) -> dict[str, object]:
-        return {
-            "id": entry.id,
-            "object": "session.environment.filesystem.entry",
-            "name": entry.name,
-            "path": entry.path,
-            "type": entry.type,
-            "bytes": entry.bytes,
-            "modified_at": entry.modified_at,
-        }
+        from omnigent.runner.environment_filesystem import entry_payload
+
+        return entry_payload(entry)
 
     @app.post("/v1/sessions/{session_id}/resources/environments/{environment_id}/shell")
     async def run_environment_shell(
@@ -12450,12 +12551,9 @@ def create_runner_app(
 
     @app.post("/v1/sessions/{session_id}/reset-state")
     async def reset_session_state(session_id: str) -> JSONResponse:
-        # Bumped first: a terminal already starting must not register after the
-        # teardown below, which only closes what is registered right now.
+        # Invalidate in-flight launches before tearing down registered terminals.
         _session_terminal_epochs[session_id] = _session_terminal_epochs.get(session_id, 0) + 1
-        # Registry-level twin of that bump: fences creators that publish
-        # through TerminalRegistry.launch directly (e.g. sys_terminal_launch),
-        # which never see the per-context fence above.
+        # Direct registry callers need the same fence.
         if resource_registry.terminal_registry is not None:
             resource_registry.terminal_registry.supersede_inflight_launches(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
@@ -12471,8 +12569,7 @@ def create_runner_app(
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await _teardown_session_terminals(session_id)
-        # A codex app-server stored before its terminal registered is invisible
-        # to the teardown above; close it or the subprocess outlives the reset.
+        # The app-server may exist before its terminal is registered.
         await _native_runtime.teardown_codex_native_app_server(session_id)
         await resource_registry.cleanup_session(session_id)
         _clear_session_agent_caches(session_id, _session_agent_ids.get(session_id))

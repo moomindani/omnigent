@@ -2454,7 +2454,7 @@ export function AppShell() {
           {/* Match the previous toast system's effectively unbounded stack so
               security prompts cannot be hidden behind ordinary notifications. */}
           <Toaster
-            position="bottom-right"
+            position="top-center"
             visibleToasts={100}
             offset={{
               right: "1rem",

@@ -40,6 +40,7 @@ import re
 import secrets
 import shlex
 import socket
+import socketserver
 import stat
 import sys
 import tempfile
@@ -51,7 +52,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from http import HTTPStatus
-from http.client import HTTPException
+from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
@@ -60,7 +61,7 @@ from urllib import request
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
-from omnigent._platform import is_wsl, stable_user_id
+from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
 from omnigent.harnesses.kiro_native.bridge import bridge_root as kiro_bridge_root
@@ -187,6 +188,10 @@ APPROVAL_WAIT_MARKER_REFRESH_S = 60.0
 APPROVAL_WAIT_MARKER_TTL_S = 420.0
 _CONFIG_FILE = "bridge.json"
 _SERVER_FILE = "server.json"
+# Control socket of one ``serve-mcp`` process under the harness socket root,
+# named by owner pid so a socket left behind by a dead process can be reaped.
+_MCP_SOCKET_PREFIX = "mcp-"
+_MCP_SOCKET_SUFFIX = ".sock"
 _STATE_FILE = "state.json"
 _HOOKS_FILE = "hooks.jsonl"
 OBSERVER_HOOK_STDERR_FILE = "observer_hook.stderr"
@@ -211,6 +216,8 @@ _MCP_PROTOCOL_VERSION = "2024-11-05"
 # uses.
 _TOOLS_CHANGED_READY_TIMEOUT_S = 30.0
 _TOOLS_CHANGED_POST_TIMEOUT_S = 10.0
+# The control POST carries an empty JSON object; anything larger is not ours.
+_TOOLS_CHANGED_BODY_MAX_BYTES = 4096
 # Ceiling the relay HTTP handler (``_run_relay_tool``) waits for a single
 # tool dispatch to complete on the harness event loop.
 _TOOL_CALL_TIMEOUT_S = 300.0
@@ -1282,23 +1289,36 @@ def _ensure_secure_dir(target: Path) -> None:
     getuid = getattr(os, "getuid", None)
     my_uid = getuid() if getuid is not None else None
     for ancestor in ancestors:
-        try:
-            os.mkdir(ancestor, mode=0o700)
-            continue
-        except FileExistsError:
-            pass
-        st = os.lstat(ancestor)
-        if stat.S_ISLNK(st.st_mode):
-            raise RuntimeError(f"refusing to use bridge ancestor {ancestor!s}: is a symlink")
-        if not stat.S_ISDIR(st.st_mode):
-            raise RuntimeError(f"refusing to use bridge ancestor {ancestor!s}: not a directory")
-        if my_uid is not None and st.st_uid != my_uid:
-            raise RuntimeError(
-                f"refusing to use bridge ancestor {ancestor!s}: owned by uid "
-                f"{st.st_uid}, not current user ({my_uid})"
-            )
-        if my_uid is not None and (st.st_mode & 0o077) != 0:
-            os.chmod(ancestor, 0o700)
+        _ensure_private_dir(ancestor, my_uid)
+
+
+def _ensure_private_dir(path: Path, my_uid: int | None) -> None:
+    """
+    Create ``path`` as a 0o700 directory, or validate an existing one.
+
+    :param path: Directory that must be owner-only, e.g. one bridge ancestor
+        or the harness socket root.
+    :param my_uid: Current uid, or ``None`` where POSIX ownership does not
+        apply (Windows), which skips the owner and mode checks.
+    :raises RuntimeError: If ``path`` exists as a symlink, a non-directory,
+        or a directory owned by another uid.
+    """
+    try:
+        os.mkdir(path, mode=0o700)
+        return
+    except FileExistsError:
+        pass
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode):
+        raise RuntimeError(f"refusing to use {path!s}: is a symlink")
+    if not stat.S_ISDIR(st.st_mode):
+        raise RuntimeError(f"refusing to use {path!s}: not a directory")
+    if my_uid is not None and st.st_uid != my_uid:
+        raise RuntimeError(
+            f"refusing to use {path!s}: owned by uid {st.st_uid}, not current user ({my_uid})"
+        )
+    if my_uid is not None and (st.st_mode & 0o077) != 0:
+        os.chmod(path, 0o700)
 
 
 def ensure_secure_dir(target: Path) -> None:
@@ -4941,12 +4961,13 @@ def post_tools_changed(
     Notify Claude Code that the MCP tool list changed.
 
     Standard MCP ``notifications/tools/list_changed`` — the bridge's
-    localhost HTTP control endpoint trampolines the POST into the
-    MCP stdio writer. Unrelated to Claude's experimental Channels.
+    control endpoint (a Unix domain socket, or loopback HTTP under the
+    bind-host override) trampolines the POST into the MCP stdio writer.
+    Unrelated to Claude's experimental Channels.
 
     :param bridge_dir: Bridge directory path.
-    :param timeout_s: Seconds to wait for the bridge HTTP control
-        endpoint to publish itself, e.g. ``30.0``.
+    :param timeout_s: Seconds to wait for the bridge control endpoint
+        to publish itself, e.g. ``30.0``.
     :param cancelled: Stops waiting when the notifying task is cancelled.
     :returns: None.
     :raises RuntimeError: If the bridge server is not ready, cannot
@@ -4960,24 +4981,65 @@ def post_tools_changed(
         # treat this notification as best-effort and only expect RuntimeError.
         raise RuntimeError(f"failed to read the Claude native bridge server info: {exc}") from exc
     token = server.get("token")
-    url = server.get("url")
-    if not isinstance(token, str) or not isinstance(url, str):
-        raise RuntimeError("Claude native bridge server file is missing url/token")
-    req = request.Request(
-        f"{url}/tools-changed",
-        data=b"{}",
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-    )
+    if not isinstance(token, str):
+        raise RuntimeError("Claude native bridge server file is missing token")
     try:
-        with request.urlopen(req, timeout=_TOOLS_CHANGED_POST_TIMEOUT_S) as resp:
-            if resp.status >= 400:
-                raise RuntimeError(f"tools-changed POST failed with HTTP {resp.status}")
+        connection = _control_connection(server)
+        try:
+            connection.request(
+                "POST",
+                "/tools-changed",
+                body=b"{}",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            status = connection.getresponse().status
+        finally:
+            connection.close()
     except (OSError, HTTPException) as exc:
         raise RuntimeError(f"failed to notify Claude tool list change: {exc}") from exc
+    if status >= 400:
+        raise RuntimeError(f"tools-changed POST failed with HTTP {status}")
+
+
+def _control_connection(server: _JsonObject) -> HTTPConnection:
+    """
+    Open the client side of the control endpoint *server* advertises.
+
+    :param server: Parsed ``server.json``: a ``socket`` path, or under the
+        bind-host override a ``url`` such as ``"http://127.0.0.1:28700"``.
+    :returns: An unconnected connection; ``request`` connects it.
+    :raises RuntimeError: If the advertisement names neither endpoint.
+    """
+    socket_path = server.get("socket")
+    if isinstance(socket_path, str):
+        return _UnixHTTPConnection(socket_path, timeout=_TOOLS_CHANGED_POST_TIMEOUT_S)
+    url = server.get("url")
+    if not isinstance(url, str):
+        raise RuntimeError("Claude native bridge server file is missing socket/url")
+    return HTTPConnection(urllib.parse.urlsplit(url).netloc, timeout=_TOOLS_CHANGED_POST_TIMEOUT_S)
+
+
+class _UnixHTTPConnection(HTTPConnection):
+    """
+    :class:`HTTPConnection` over a Unix domain socket instead of TCP.
+
+    :param socket_path: Path of the listening socket.
+    :param timeout: Connect and read timeout in seconds.
+    """
+
+    def __init__(self, socket_path: str, *, timeout: float) -> None:
+        super().__init__("localhost", timeout=timeout)
+        self._socket_path = socket_path
+
+    def connect(self) -> None:
+        """Connect to the socket path instead of resolving a TCP host."""
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        sock.connect(self._socket_path)
+        self.sock = sock
 
 
 def _run_tmux(socket_path: str, *args: str) -> None:
@@ -6004,28 +6066,37 @@ def _start_http_ingress(
     bridge_dir: Path,
     token: str,
     notification_queue: queue.Queue[_JsonObject | None],
-) -> ThreadingHTTPServer:
+) -> socketserver.BaseServer:
     """
     Start the bridge control HTTP server.
 
     Currently only serves ``POST /tools-changed``, which queues a
     standard MCP ``notifications/tools/list_changed`` for the stdio
-    writer to emit.
+    writer to emit. It listens on a Unix domain socket, so a session
+    costs no loopback TCP port for it: remote-dev port forwarders mirror
+    every TCP listener to the laptop and cap how many they will. The
+    :data:`BRIDGE_BIND_HOST_ENV_VAR` sandbox posture keeps the TCP bind
+    from the port pool, as does Windows, which has no Unix sockets.
 
     :param bridge_dir: Bridge directory path.
     :param token: Bearer token used for local requests.
     :param notification_queue: Queue consumed by the MCP stdout
         writer thread.
-    :returns: Started :class:`ThreadingHTTPServer`.
+    :returns: Started server; ``shutdown`` and ``server_close`` end it.
     """
     handler_cls = _handler_factory(token, notification_queue)
-    httpd, advertised_url = _start_bridge_http_server(handler_cls)
     server_info: _JsonObject = {
-        "url": advertised_url,
         "token": token,
         "pid": os.getpid(),
         "updated_at": time.time(),
     }
+    httpd: socketserver.BaseServer
+    if IS_WINDOWS or os.environ.get(BRIDGE_BIND_HOST_ENV_VAR, "").strip():
+        httpd, advertised_url = _start_bridge_http_server(handler_cls)
+        server_info["url"] = advertised_url
+    else:
+        httpd, socket_path = _start_unix_control_server(handler_cls)
+        server_info["socket"] = str(socket_path)
     _write_json_file(bridge_dir / _SERVER_FILE, server_info)
     thread = threading.Thread(
         target=httpd.serve_forever,
@@ -6034,6 +6105,56 @@ def _start_http_ingress(
     )
     thread.start()
     return httpd
+
+
+def _start_unix_control_server(
+    handler_cls: type[BaseHTTPRequestHandler],
+) -> tuple[socketserver.BaseServer, Path]:
+    """
+    Bind the control server to a Unix domain socket and return it with the path.
+
+    The socket lives directly under the harness socket root — short by
+    design, since ``sun_path`` caps at 104 bytes on macOS — as
+    ``mcp-<pid>.sock``. The root is made absolute (the runner reads the path
+    from its own working directory) and validated as an owner-only directory,
+    since a pre-created root would let another local user swap the socket.
+    Sockets left behind by ``serve-mcp`` processes that died without cleanup
+    (a killed pane) are reaped first, by owner pid.
+
+    :param handler_cls: Request handler class.
+    :returns: The bound, listening server and its socket path (mode 0600).
+    """
+    from omnigent.inner._proc import process_alive
+    from omnigent.runtime.harnesses.paths import resolve_harness_tmp_parent
+
+    root = resolve_harness_tmp_parent()
+    # A configured root may be nested (``OMNIGENT_HARNESS_TMP_PARENT=.tmp/oa``);
+    # only the leaf must be owner-only.
+    root.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(root, os.getuid())
+    for stale in root.glob(f"{_MCP_SOCKET_PREFIX}*{_MCP_SOCKET_SUFFIX}"):
+        try:
+            owner = int(stale.name[len(_MCP_SOCKET_PREFIX) : -len(_MCP_SOCKET_SUFFIX)])
+        except ValueError:
+            continue
+        if owner == os.getpid() or not process_alive(owner):
+            with contextlib.suppress(OSError):
+                stale.unlink()
+    socket_path = root / f"{_MCP_SOCKET_PREFIX}{os.getpid()}{_MCP_SOCKET_SUFFIX}"
+
+    class _UnixControlServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        """Threaded HTTP server on a Unix socket; removes the socket file on close."""
+
+        daemon_threads = True
+
+        def server_close(self) -> None:
+            super().server_close()
+            with contextlib.suppress(OSError):
+                socket_path.unlink()
+
+    httpd = _UnixControlServer(str(socket_path), handler_cls)
+    os.chmod(socket_path, 0o600)
+    return httpd, socket_path
 
 
 def _handler_factory(
@@ -6086,6 +6207,14 @@ def _handler_factory(
             if self.headers.get("Authorization") != f"Bearer {token}":
                 self.send_error(HTTPStatus.UNAUTHORIZED)
                 return
+            length = int(self.headers.get("Content-Length") or 0)
+            if not 0 <= length <= _TOOLS_CHANGED_BODY_MAX_BYTES:
+                self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                return
+            # Drain the body before answering: the client writes it after the
+            # headers, and closing first turns that write into EPIPE on a Unix
+            # socket (TCP only surfaced it as a reset after the response).
+            self.rfile.read(length)
             notification_queue.put(
                 {
                     "jsonrpc": "2.0",
@@ -8697,7 +8826,7 @@ def _wait_for_server_info(
     bridge_dir: Path, *, timeout_s: float, cancelled: threading.Event | None = None
 ) -> _JsonObject:
     """
-    Wait for the bridge control HTTP endpoint file.
+    Wait for the bridge control endpoint file.
 
     :param bridge_dir: Bridge directory path.
     :param timeout_s: Seconds to wait, e.g. ``30.0``.
@@ -8711,7 +8840,11 @@ def _wait_for_server_info(
         if cancelled is not None and cancelled.is_set():
             raise RuntimeError("Claude native bridge notification was cancelled")
         payload = _read_json_file(path)
-        if isinstance(payload, dict) and payload.get("url") and payload.get("token"):
+        if (
+            isinstance(payload, dict)
+            and payload.get("token")
+            and (payload.get("socket") or payload.get("url"))
+        ):
             return payload
         if cancelled is None:
             time.sleep(0.05)

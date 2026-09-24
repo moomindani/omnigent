@@ -252,6 +252,13 @@ _CODEX_AUTH_ERROR_FRAGMENTS = (
 _CODEX_ERROR_KIND_AUTH = "auth"
 _CODEX_ERROR_KIND_GENERIC = "generic"
 _CODEX_REAUTH_HINT = "If this looks like an auth issue, running `codex login` may help."
+# Budget/quota exhaustion from the AI gateway: the gateway returns HTTP 403 +
+# PERMISSION_DENIED for these, which looks like auth to the generic checks —
+# it isn't. Re-authenticating cannot resolve a spending limit.
+_CODEX_BUDGET_EXHAUSTED_FRAGMENTS = (
+    "has reached its limit",
+    "rate limit is set to 0",
+)
 
 
 @dataclass
@@ -954,11 +961,17 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
     matching against :data:`_CODEX_AUTH_ERROR_FRAGMENTS` for versions/shapes
     that omit it.
 
+    Budget/quota exhaustion is checked first: the AI gateway returns HTTP 403
+    for these, which the auth checks below would otherwise misclassify.
+
     :param error: The ``turn.error`` object.
     :param message: Its already-extracted message text.
     :returns: :data:`_CODEX_ERROR_KIND_AUTH` or
         :data:`_CODEX_ERROR_KIND_GENERIC`.
     """
+    lowered = message.lower()
+    if any(fragment in lowered for fragment in _CODEX_BUDGET_EXHAUSTED_FRAGMENTS):
+        return _CODEX_ERROR_KIND_GENERIC
     info = error.get("codexErrorInfo")
     variant: str | None = None
     http_status: object = None
@@ -970,7 +983,6 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
     variant_is_auth = variant is not None and variant.lower() in _CODEX_AUTH_ERROR_INFO
     if variant_is_auth or http_status in _CODEX_AUTH_HTTP_STATUS:
         return _CODEX_ERROR_KIND_AUTH
-    lowered = message.lower()
     if any(fragment in lowered for fragment in _CODEX_AUTH_ERROR_FRAGMENTS):
         return _CODEX_ERROR_KIND_AUTH
     return _CODEX_ERROR_KIND_GENERIC

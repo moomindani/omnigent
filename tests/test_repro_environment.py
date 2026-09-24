@@ -262,6 +262,8 @@ def test_stop_during_startup_is_successful_cancellation(tmp_path, monkeypatch):
 
     from dev.repro_env import runtime
 
+    monkeypatch.setattr("dev.repro_env.doctor.launch_observations", lambda root: {})
+
     state = tmp_path / "environment.json"
     state.write_text(
         json.dumps(
@@ -364,6 +366,8 @@ def test_supervisor_terminates_children_when_relay_cleanup_fails(tmp_path, monke
     import time
 
     from dev.repro_env import runtime
+
+    monkeypatch.setattr("dev.repro_env.doctor.launch_observations", lambda root: {})
 
     state = tmp_path / "environment.json"
     state.write_text(

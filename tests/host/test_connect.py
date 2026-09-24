@@ -13,7 +13,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from websockets.datastructures import Headers
@@ -37,6 +37,7 @@ from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
+    HostFsRequestFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
     HostImportLocalByIdFrame,
@@ -6159,6 +6160,152 @@ async def test_slow_frame_does_not_head_of_line_block(
     assert any('"req_slow"' in frame for frame in ws.sent)
 
 
+@pytest.mark.parametrize("stage", ["queued", "preflight", "spawn"])
+async def test_runner_status_waits_for_pending_launch(
+    stage: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Pending launches must not look absent, including while queued."""
+    host = _make_host_process()
+    ws = _CollectingWs()
+    loop = asyncio.get_running_loop()
+    launch_started = asyncio.Event()
+    status_started = asyncio.Event()
+    release_launch = threading.Event()
+    proc = Mock(spec=subprocess.Popen, pid=1234)
+    proc.poll.return_value = None
+
+    def _pause() -> None:
+        loop.call_soon_threadsafe(launch_started.set)
+        assert release_launch.wait(5.0), "test did not release launch"
+
+    def _preflight(_harness: str) -> bool:
+        if stage == "preflight":
+            _pause()
+        return True
+
+    def _spawn(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
+        if stage == "spawn":
+            _pause()
+        return proc, tmp_path / "runner.log"
+
+    real_status = host._handle_runner_status
+
+    async def _status(frame: HostRunnerStatusFrame) -> HostRunnerStatusResultFrame:
+        status_started.set()
+        return await real_status(frame)
+
+    monkeypatch.setattr("omnigent.host.connect.harness_is_configured", _preflight)
+    monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
+    monkeypatch.setattr(host, "_spawn_runner_proc", _spawn)
+    monkeypatch.setattr(host, "_watch_runner", AsyncMock())
+    monkeypatch.setattr(host, "_handle_runner_status", _status)
+    frame = HostLaunchRunnerFrame(
+        request_id="launch",
+        binding_token="pending-token",
+        workspace=str(tmp_path),
+        harness="claude-native",
+    )
+    runner_id = token_bound_runner_id(frame.binding_token)
+    if stage == "queued":
+        await host._runner_lifecycle_lock.acquire()
+    launch = asyncio.create_task(host._dispatch_host_frame(ws, frame))  # type: ignore[arg-type]
+    queries: list[asyncio.Task[None]] = []
+    try:
+        if stage != "queued":
+            await asyncio.wait_for(launch_started.wait(), 5.0)
+        query = asyncio.create_task(
+            host._dispatch_host_frame(  # type: ignore[arg-type]
+                ws, HostRunnerStatusFrame(request_id="status", runner_id=runner_id)
+            )
+        )
+        queries.append(query)
+        await asyncio.wait_for(status_started.wait(), 5.0)
+        assert not query.done(), f"pending launch reported a premature status: {ws.sent}"
+
+        unrelated = await asyncio.wait_for(
+            real_status(HostRunnerStatusFrame(request_id="unrelated", runner_id="runner_absent")),
+            1.0,
+        )
+        assert unrelated.status == "unknown"
+
+        query.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await query
+        status_started.clear()
+        second = asyncio.create_task(
+            host._dispatch_host_frame(  # type: ignore[arg-type]
+                ws, HostRunnerStatusFrame(request_id="second", runner_id=runner_id)
+            )
+        )
+        queries.append(second)
+        await asyncio.wait_for(status_started.wait(), 5.0)
+        assert not second.done(), "cancelling one query must not settle the pending launch"
+    finally:
+        release_launch.set()
+        if stage == "queued":
+            host._runner_lifecycle_lock.release()
+        await asyncio.wait_for(asyncio.gather(launch, *queries, return_exceptions=True), 5.0)
+        await asyncio.gather(*host._watcher_tasks)
+
+    results = [decode_host_frame(raw) for raw in ws.sent]
+    statuses = [result for result in results if isinstance(result, HostRunnerStatusResultFrame)]
+    assert [(result.request_id, result.status) for result in statuses] == [("second", "alive")]
+    assert host._runners[runner_id].proc is proc
+
+
+@pytest.mark.parametrize("outcome", ["refused", "error"])
+async def test_runner_status_settles_after_unsuccessful_launch(
+    outcome: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refusal and handler failure must release status waiters."""
+    host = _make_host_process()
+    ws = _CollectingWs()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    status_started = asyncio.Event()
+    frame = HostLaunchRunnerFrame(
+        request_id="launch", binding_token="failed-token", workspace="/w"
+    )
+
+    async def _launch(frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
+        entered.set()
+        await release.wait()
+        if outcome == "error":
+            raise RuntimeError("launch handler failed")
+        return HostLaunchRunnerResultFrame(request_id=frame.request_id, status="failed")
+
+    async def _query() -> HostRunnerStatusResultFrame:
+        status_started.set()
+        return await host._handle_runner_status(
+            HostRunnerStatusFrame(
+                request_id="status",
+                runner_id=token_bound_runner_id(frame.binding_token),
+            )
+        )
+
+    monkeypatch.setattr(host, "_handle_launch", _launch)
+    launch = asyncio.create_task(host._dispatch_host_frame(ws, frame))  # type: ignore[arg-type]
+    query: asyncio.Task[HostRunnerStatusResultFrame] | None = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5.0)
+        query = asyncio.create_task(_query())
+        await asyncio.wait_for(status_started.wait(), 5.0)
+        assert not query.done()
+        release.set()
+        result = await asyncio.wait_for(query, 5.0)
+        assert result.status == "unknown"
+        assert not host._pending_runner_launches
+    finally:
+        release.set()
+        await asyncio.gather(launch, return_exceptions=True)
+        if query is not None:
+            query.cancel()
+            await asyncio.gather(query, return_exceptions=True)
+
+
 async def test_stop_frame_never_overtakes_launch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7192,3 +7339,123 @@ async def test_github_pr_update_reports_lock_contention_on_host(
     assert registry.path.read_bytes() == before
     assert host._handle_fs_write(frame).status == "ok"
     assert (target in {entry.url for entry in registry.list()}) == (action == "attach")
+
+
+def test_fs_search_reuses_the_changed_files_snapshot_across_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each fs request arrives as its own frame, so the reader — and the
+    registry snapshot search reuses for untracked files — must survive from a
+    Changed-tab request to a later search. A fresh reader per request never has
+    the snapshot, and an untracked file past the walk budget goes unfound."""
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=ws, check=True)
+    many = ws / "aaa"
+    many.mkdir()
+    for i in range(60):
+        (many / f"f{i:02d}.txt").write_text("x")
+    subprocess.run(["git", "add", "-A"], cwd=ws, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ],
+        cwd=ws,
+        check=True,
+    )
+    (ws / "zzz").mkdir()
+    (ws / "zzz" / "scratch.txt").write_text("untracked")
+    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 10)
+    host = _make_host_process()
+    try:
+        changes = host._handle_fs_request(
+            HostFsRequestFrame(request_id="r1", op="changes", workspace=str(ws), session_id="conv")
+        )
+        assert changes.status == "ok", changes
+        search = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="r2",
+                op="search",
+                workspace=str(ws),
+                session_id="conv",
+                params={"q": "scratch"},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+
+    assert search.status == "ok", search
+    assert [e["path"] for e in search.payload["data"]] == ["zzz/scratch.txt"], search.payload
+
+
+def test_fs_reader_picks_up_a_repo_created_after_first_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace that gains a git repository after its first fs request (a
+    clone landing in a fresh directory) must get git-index search coverage on
+    later requests, not stay pinned to the reader built before the repo
+    existed."""
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    many = ws / "aaa"
+    many.mkdir()
+    for i in range(60):
+        (many / f"f{i:02d}.txt").write_text("x")
+    (ws / "zzz").mkdir()
+    (ws / "zzz" / "target.jsonnet").write_text("y")
+    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 10)
+    host = _make_host_process()
+    try:
+        first = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="r1",
+                op="search",
+                workspace=str(ws),
+                session_id="conv",
+                params={"q": "target"},
+            )
+        )
+        assert first.status == "ok", first
+        assert first.payload["data"] == [], first.payload
+        assert first.payload["truncated"] is True
+
+        subprocess.run(["git", "init", "-q"], cwd=ws, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=ws, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+            cwd=ws,
+            check=True,
+        )
+
+        second = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="r2",
+                op="search",
+                workspace=str(ws),
+                session_id="conv",
+                params={"q": "target"},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+
+    assert second.status == "ok", second
+    assert [e["path"] for e in second.payload["data"]] == ["zzz/target.jsonnet"], second.payload

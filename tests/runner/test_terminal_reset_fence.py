@@ -1,18 +1,4 @@
-"""Regression: a session reset must fence a terminal that is still starting.
-
-``POST /v1/sessions/{id}/reset-state`` closes the terminals the registry holds at
-that moment, but a creator already past its spec resolution keeps going -- the
-registry takes the slot only once the start completes. A terminal built from the
-spec the reset retired could therefore register itself after the reset finished
-and be handed straight back to the caller.
-
-The fence makes the in-flight launch notice the reset, drop what it built, and
-report a conflict instead of attaching a terminal from the previous agent.
-
-Dropping is scoped to what the fenced launch itself registered: the reset also
-released the per-harness ensure lock, so a launch that started afterwards may
-already own a terminal in the same session and must survive.
-"""
+"""Reset refuses a stale native terminal without closing its successor."""
 
 from __future__ import annotations
 
@@ -46,7 +32,6 @@ async def test_reset_during_terminal_launch_refuses_the_stale_terminal(
     release_adapter = asyncio.Event()
 
     async def _adapter(ctx: Any) -> SessionResourceView:
-        """Stand in for the harness auto-create hook, pausing mid-start."""
         entered_adapter.set()
         await release_adapter.wait()
         return SessionResourceView(
@@ -59,7 +44,6 @@ async def test_reset_during_terminal_launch_refuses_the_stale_terminal(
     real_resolve_hook = orchestration.resolve_hook
 
     def _resolve_hook(provider: Any, name: str) -> Any:
-        """Swap in the pausing adapter, leaving every other hook alone."""
         if name == "auto_create_terminal":
             return _adapter
         return real_resolve_hook(provider, name)
@@ -95,8 +79,6 @@ async def test_reset_during_terminal_launch_refuses_the_stale_terminal(
         reset = await client.post(f"/v1/sessions/{_CONV}/reset-state")
         assert reset.status_code == 200
 
-        # The launch completes only now, after the reset has already torn down
-        # everything it could see.
         release_adapter.set()
         response = await asyncio.wait_for(ensure, timeout=5)
 

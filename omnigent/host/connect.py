@@ -18,11 +18,13 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, SupportsIndex, SupportsInt, TypeVar, cast
+from typing import TYPE_CHECKING, Literal, SupportsIndex, SupportsInt, TypeVar, cast
 
 import click
 import httpx
@@ -175,6 +177,12 @@ from omnigent.util.tunnel_limits import (
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
 from omnigent.version import VERSION
+
+if TYPE_CHECKING:
+    from omnigent.workspace_fs import WorkspaceReader
+
+# Workspaces whose fs reader (and change registry) stay warm between requests.
+_FS_READER_CACHE_SIZE = 8
 
 _logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
@@ -657,6 +665,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # NAMES, not secrets, so allowlisting it leaks nothing on its own.
         # (Literal, not RUNNER_ENV_PASSTHROUGH_ENV_VAR, which is defined below.)
         "OMNIGENT_RUNNER_ENV_PASSTHROUGH",
+        # Executable selection must survive CLI -> daemon -> runner. The
+        # passthrough list is only applied at the second boundary.
+        "OMNIGENT_CODEX_PATH",
         # Credential-env denylists must survive both daemon and runner hops.
         # This carries variable names only; their values still follow normal forwarding.
         "OMNIGENT_PI_ENV_UNSET",
@@ -1055,6 +1066,11 @@ class HostProcess:
         """
         self._identity = identity
         self._server_url = server_url.rstrip("/")
+        # One reader per workspace, so its registry keeps state between
+        # requests (the changed-files snapshot search reuses for untracked
+        # files). Each entry remembers the repository root it was built for.
+        self._fs_readers: OrderedDict[str, tuple[Path | None, WorkspaceReader]] = OrderedDict()
+        self._fs_readers_lock = threading.Lock()
         self._interactive_shells = normalize_interactive_shells(
             interactive_shells
             if interactive_shells is not None
@@ -1186,6 +1202,9 @@ class HostProcess:
         # this lock: a session DELETE racing a slow create must not have its
         # stop overtake the launch it targets.
         self._runner_lifecycle_lock = asyncio.Lock()
+        # Status queries wait for this runner's queued launch before deciding
+        # that an unregistered runner is unknown.
+        self._pending_runner_launches: dict[str, set[asyncio.Future[None]]] = {}
         # Strong refs to in-flight frame tasks (create_task results are
         # otherwise GC-able); each discards itself on completion.
         self._frame_tasks: set[asyncio.Task[None]] = set()
@@ -2189,25 +2208,42 @@ class HostProcess:
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=5.0)
 
+    def _track_pending_runner_launch(
+        self, runner_id: str, completion: asyncio.Future[None]
+    ) -> None:
+        """Keep queued and active launches visible to this runner's status queries."""
+        pending = self._pending_runner_launches.setdefault(runner_id, set())
+        pending.add(completion)
+
+        def _finished(done: asyncio.Future[None]) -> None:
+            pending.discard(done)
+            if not pending:
+                self._pending_runner_launches.pop(runner_id, None)
+
+        completion.add_done_callback(_finished)
+
     async def _handle_runner_status(
         self,
         frame: HostRunnerStatusFrame,
     ) -> HostRunnerStatusResultFrame:
         """Answer whether a runner's process is alive, dead, or unknown.
 
-        The host is the authoritative owner of runner liveness: it holds
-        the runner's :class:`subprocess.Popen`. A runner tracked with a
-        still-running process is ``alive`` (covers a runner that is still
-        booting — it is inserted at ``Popen`` time, before its tunnel
-        connects — so the server waits for it). A tracked-but-exited
-        process is ``dead``. A runner this host has no record of is
-        ``unknown`` — it was stopped (``_handle_stop`` popped it) or a
-        fresh post-restart host never spawned it; either way it will never
-        connect, so the server relaunches without waiting.
+        Wait for this runner's queued launch and spawn before checking its
+        process. An unregistered runner can still be starting; reporting it
+        as unknown would cause the server to replace it. Unrelated runners'
+        status queries remain independent.
+
+        A tracked running process is ``alive`` (booting or serving), an
+        exited process is ``dead``, and an untracked runner with no pending
+        launch is ``unknown``. The server can recover promptly in the latter
+        two cases.
 
         :param frame: The status query frame.
         :returns: Result frame with ``alive`` / ``dead`` / ``unknown``.
         """
+        while pending := self._pending_runner_launches.get(frame.runner_id):
+            # Shield shared completions from a status request's cancellation.
+            await asyncio.shield(asyncio.gather(*pending, return_exceptions=True))
         handle = self._runners.get(frame.runner_id)
         if handle is None:
             status = "unknown"
@@ -2902,6 +2938,7 @@ class HostProcess:
         """
         from pathlib import Path
 
+        from omnigent.runtime.filesystem_registry import detect_git_root
         from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
 
         try:
@@ -2923,7 +2960,18 @@ class HostProcess:
                 error="workspace directory does not exist on host",
             )
 
-        reader = WorkspaceReader(Path(expanded))
+        # Re-detect the repository every time: a workspace that gains or loses
+        # a .git after its first request needs a reader of the matching kind.
+        repo_root = detect_git_root(Path(expanded))
+        with self._fs_readers_lock:
+            cached = self._fs_readers.get(expanded)
+            if cached is None or cached[0] != repo_root:
+                cached = (repo_root, WorkspaceReader(Path(expanded)))
+                self._fs_readers[expanded] = cached
+                while len(self._fs_readers) > _FS_READER_CACHE_SIZE:
+                    self._fs_readers.popitem(last=False)
+            self._fs_readers.move_to_end(expanded)
+            reader = cached[1]
         params = frame.params or {}
         try:
             payload = self._dispatch_fs_op(reader, frame.op, frame.session_id, params)
@@ -3248,8 +3296,6 @@ class HostProcess:
         :raises ValueError: On an unknown op.
         """
         from typing import cast
-
-        from omnigent.workspace_fs import WorkspaceReader
 
         r = cast("WorkspaceReader", reader)
         if op == "list_or_read":
@@ -4443,13 +4489,18 @@ class HostProcess:
             # _serve_frames so detached request tasks cannot swallow it.
             self._raise_connection_error(frame)
         if isinstance(frame, HostLaunchRunnerFrame):
-            # Frames run on concurrent tasks, but launch/stop must keep their
-            # arrival order relative to each other (a stop for a session must
-            # not overtake the launch it targets). The lock is this task's
-            # first await, and tasks start in frame-arrival order, so waiters
-            # queue FIFO in that same order — keep it first.
-            async with self._runner_lifecycle_lock:
-                launch_result = await self._handle_launch(frame)
+            completion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            if frame.binding_token.strip():
+                self._track_pending_runner_launch(
+                    token_bound_runner_id(frame.binding_token), completion
+                )
+            # Register before queuing; keep the lifecycle lock as the first
+            # await so launch/stop frames still acquire it in arrival order.
+            try:
+                async with self._runner_lifecycle_lock:
+                    launch_result = await self._handle_launch(frame)
+            finally:
+                completion.set_result(None)
             await ws.send(encode_host_frame(launch_result))
         elif isinstance(frame, HostStopRunnerFrame):
             async with self._runner_lifecycle_lock:

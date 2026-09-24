@@ -386,6 +386,23 @@ request enforces this, so unsigned commits will block merging.
   section showing the new behaviour, so reviewers can see it without checking
   out the branch.
 
+### Database migration reviews
+
+Follow the [database best practices](docs/DATABASE_BEST_PRACTICES.md) when
+changing schemas, queries, transactions, or storage code. Polly uses this
+reference in its reviews and treats violations of mandatory requirements as
+blocking findings.
+
+Changes under `omnigent/db/migrations/`, to `omnigent/db/alembic.ini`, or to
+[`.github/CODEOWNERS`](.github/CODEOWNERS) require a GitHub approval from at
+least one of Edwin He (`@Edwinhe03`), Aravind Segu (`@aravind-segu`), Corey
+Zumar (`@dbczumar`), or Bryan Qiu (`@bbqiu`). The reviewer must be someone
+other than the PR author, including for maintainer-authored PRs.
+
+GitHub requests these reviews automatically. The `main-no-force-push` ruleset
+requires code-owner approval and dismisses stale approvals after changes are
+pushed. This requirement is enforced by GitHub alongside the CI checks.
+
 ### Every PR needs an issue
 
 We require an issue for every pull request. Issues are how work gets

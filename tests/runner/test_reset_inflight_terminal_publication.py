@@ -1,23 +1,4 @@
-"""Session reset must fence an in-flight terminal publication.
-
-``POST /v1/sessions/{id}/reset-state`` (the in-place agent-switch reset)
-closes the terminals registered *at that moment* and clears the
-agent-derived caches, but it does not stop a terminal creator that is
-already past spec resolution. ``TerminalRegistry.launch`` starts the
-terminal outside the registry lock and takes the slot only when the start
-completes, so a creator that resolved the previous agent's spec before the
-reset registers its terminal *after* the reset finishes — the session
-keeps a terminal belonging to an agent it no longer runs.
-
-Codex sessions leak more: creation stores the app-server in the session
-slot before it registers the terminal, and ``reset_session_state`` never
-calls ``teardown_codex_native_app_server``, so a reset landing in that
-window leaves the app-server subprocess registered forever.
-
-These tests drive the real runner FastAPI endpoints with a latch inside
-the terminal start procedure, because the bug's window (between spawn and
-registration) is not reachable deterministically with a real tmux spawn.
-"""
+"""Fence terminal publication and app-server ownership across runner resets."""
 
 from __future__ import annotations
 
@@ -40,46 +21,36 @@ from tests.runner.helpers import RunningFlagTerminalInstance
 
 
 class _AgentBoundServerClient:
-    """AP-server stub whose session snapshot reports a mutable ``agent_id``.
-
-    Flipping :attr:`agent_id` simulates the in-place agent switch that
-    rebinds the conversation to a new agent before the runner-side reset.
-    """
+    """Server stub whose agent binding changes during a reset."""
 
     class _Response:
         """Minimal 200 response carrying a fixed JSON body."""
 
         def __init__(self, body: dict[str, Any]) -> None:
-            """:param body: JSON body returned by :meth:`json`."""
             self.status_code = 200
             self._body = body
 
         def json(self) -> dict[str, Any]:
-            """:returns: The fixed JSON body."""
             return self._body
 
         def raise_for_status(self) -> None:
-            """No-op: the stub always succeeds."""
+            """The stub always succeeds."""
 
     def __init__(self, workspace: str) -> None:
-        """:param workspace: Absolute workspace path reported in the snapshot."""
         self.agent_id = "agent_a"
         self._workspace = workspace
 
     async def get(self, url: str, **kwargs: Any) -> _AgentBoundServerClient._Response:
-        """Report the session snapshot with the current ``agent_id`` binding."""
         del url, kwargs
         return self._Response(
             {"created_at": 0.0, "workspace": self._workspace, "agent_id": self.agent_id}
         )
 
     async def post(self, url: str, **kwargs: Any) -> _AgentBoundServerClient._Response:
-        """Stub POST returning an empty 200."""
         del url, kwargs
         return self._Response({})
 
     async def patch(self, url: str, **kwargs: Any) -> _AgentBoundServerClient._Response:
-        """Stub PATCH returning an empty 200."""
         del url, kwargs
         return self._Response({})
 
@@ -89,19 +60,7 @@ async def test_reset_state_fences_inflight_terminal_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A creator latched mid-start must not survive a completed reset.
-
-    Sequence (the reported window, held open with a latch):
-
-    1. A terminal creator resolves agent A's spec and starts the terminal.
-    2. The agent switch runs ``/reset-state`` to completion — the slot is
-       still empty, so the reset sees nothing to close.
-    3. The creator completes and registers the terminal.
-
-    After the reset is complete, no terminal from the earlier spec
-    resolution may stay registered. A fix that lets the creation complete
-    and then removes the superseded resource also passes (grace window).
-    """
+    """A creator latched mid-start must not survive a completed reset."""
     conv_id = "conv_reset_fence"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -118,7 +77,6 @@ async def test_reset_state_fences_inflight_terminal_publication(
     )
 
     async def _spec_resolver(agent_id: str, session_id: str | None) -> AgentSpec:
-        """Resolve agent_a→spec_a, agent_b→spec_b (the switch target)."""
         del session_id
         return spec_a if agent_id == "agent_a" else spec_b
 
@@ -142,21 +100,18 @@ async def test_reset_state_fences_inflight_terminal_publication(
     release_launch = asyncio.Event()
 
     class _LatchedInstance(RunningFlagTerminalInstance):
-        """Terminal whose start blocks on a latch, holding the bug's window open."""
+        """Terminal whose start blocks before registration."""
 
         async def launch(self, cwd: Path | None = None) -> None:
-            """Signal the latch point, then wait for the release."""
             del cwd
             launch_started.set()
             await release_launch.wait()
             self.running = True
 
         async def close(self) -> None:
-            """Mark the instance closed without shelling out to tmux."""
             self.running = False
 
         def start_idle_watcher_thread(self, *args: Any, **kwargs: Any) -> None:
-            """No-op: the stub has no PTY to watch."""
             del args, kwargs
 
     def _latched_create(
@@ -169,7 +124,6 @@ async def test_reset_state_fences_inflight_terminal_publication(
         sandbox_override: str | None = None,
         conversation_link: str | None = None,
     ) -> TerminalCreateResult:
-        """Build a latched terminal instance instead of a real tmux session."""
         del spec, parent_os_env_spec, cwd_override, sandbox_override, conversation_link
         instance = _LatchedInstance(
             name=name,
@@ -193,18 +147,13 @@ async def test_reset_state_fences_inflight_terminal_publication(
         )
         try:
             await asyncio.wait_for(launch_started.wait(), timeout=10)
-            # The creator resolved agent A's spec and is mid-start: nothing
-            # is registered yet, so the reset sees nothing to close.
             assert terminal_registry.list_for_conversation(conv_id) == []
 
-            # The user switches the session's agent: the server rebinds the
-            # conversation and the runner-side reset runs to completion.
             server.agent_id = "agent_b"
             reset = await c.post(f"/v1/sessions/{conv_id}/reset-state")
             assert reset.status_code == 200, reset.text
             assert reset.json()["reset"] is True
 
-            # The pre-reset creator now completes and publishes its terminal.
             release_launch.set()
             await asyncio.wait_for(creator, timeout=10)
         finally:
@@ -213,8 +162,7 @@ async def test_reset_state_fences_inflight_terminal_publication(
                 creator.cancel()
                 await asyncio.gather(creator, return_exceptions=True)
 
-        # Grace window: a fix that removes the superseded resource shortly
-        # after the creation completes is also acceptable.
+        # Allow asynchronous cleanup after publication.
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             if terminal_registry.get(conv_id, "bash", "s1") is None:
@@ -242,15 +190,7 @@ async def test_reset_state_fences_inflight_terminal_publication(
 async def test_reset_state_removes_codex_app_server_stored_before_registration(
     tmp_path: Path,
 ) -> None:
-    """A codex app-server stored mid-creation must not survive a reset.
-
-    Codex creation stores the app-server in the per-session slot before it
-    registers the terminal (the forwarder comes later still). A reset that
-    lands in that window sees no terminal to close, and
-    ``reset_session_state`` never calls
-    ``teardown_codex_native_app_server`` — the app-server subprocess stays
-    registered for a session that no longer runs that agent.
-    """
+    """Reset closes an app-server stored before its terminal registered."""
     conv_id = "conv_reset_codex_app_server"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -263,7 +203,6 @@ async def test_reset_state_removes_codex_app_server_stored_before_registration(
     )
 
     async def _spec_resolver(agent_id: str, session_id: str | None) -> AgentSpec:
-        """Return a minimal spec; reset-state never resolves it."""
         del agent_id, session_id
         return AgentSpec(spec_version=1, name="any")
 
@@ -280,15 +219,13 @@ async def test_reset_state_removes_codex_app_server_stored_before_registration(
         """App-server stub recording whether the reset closed it."""
 
         def __init__(self) -> None:
-            """Start un-closed."""
             self.closed = False
 
         async def close(self) -> None:
-            """Record the close call."""
             self.closed = True
 
     fake = _FakeCodexAppServer()
-    # The mid-creation state: app-server stored, terminal not yet registered.
+    # App-server stored before its terminal registers.
     native_orchestration._AUTO_CODEX_APP_SERVERS[conv_id] = fake  # type: ignore[assignment]
     try:
         transport = httpx.ASGITransport(app=app)

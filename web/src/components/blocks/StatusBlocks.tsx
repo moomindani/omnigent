@@ -80,6 +80,8 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   codex_turn_error: "Codex ran into an error during this turn.",
   native_turn_error: "The agent ran into an error during this turn.",
   rate_limit_exceeded: "The model's rate limit was reached. You can retry this turn.",
+  budget_exhausted:
+    "The AI gateway refused this turn because a spending budget or usage limit is exhausted. Contact an admin to raise it, or use a different budget.",
 };
 
 const RETRYABLE_ERROR_CODES = new Set([

@@ -35,6 +35,12 @@ import { buildBubbles } from "@/lib/renderItems";
 import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
+import {
+  clearSessionDrafts,
+  getSessionDraft,
+  promoteSessionDraft,
+  setSessionDraft,
+} from "@/lib/sessionDrafts";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { PRESENCE_IDLE_AFTER_MS } from "@/lib/presenceIdle";
 import {
@@ -3312,6 +3318,576 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
   });
 });
 
+describe("chatStore — cancel first message during session creation", () => {
+  beforeEach(clearSessionDrafts);
+  afterEach(clearSessionDrafts);
+
+  it("cancels locally and restores the original text and raw attachments immediately", () => {
+    const file = new File(["unfinished instructions"], "instructions.txt", { type: "text/plain" });
+    const { tempConvId } = beginLocalConversation("this prompt needs correcting", [file])!;
+
+    useChatStore.getState().stop();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(useChatStore.getState()).toMatchObject({
+      conversationId: tempConvId,
+      status: "idle",
+      pendingUserMessages: [],
+      failedSendDraft: {
+        conversationId: tempConvId,
+        text: "this prompt needs correcting",
+        files: [file],
+      },
+    });
+    expect(useChatStore.getState().failedSendDraft?.files[0]).toBe(file);
+    expect(getSessionDraft(tempConvId)).toEqual({
+      text: "this prompt needs correcting",
+      files: [file],
+    });
+    expect(getSessionDraft(tempConvId)?.files[0]).toBe(file);
+  });
+
+  it.each([
+    { label: "plain message", text: "do not send this", skill: null },
+    {
+      label: "slash command",
+      text: "/review unfinished",
+      skill: { name: "review", args: "unfinished" },
+    },
+  ])("binds the real session without dispatching the canceled $label", async ({ text, skill }) => {
+    seedSession("conv_cancelled");
+    const file = new File(["attachment"], "notes.txt", { type: "text/plain" });
+    const { tempConvId, pendingMsgTempId } = beginLocalConversation(text, [file])!;
+    const navigate = vi.fn();
+    useChatStore.getState().stop();
+
+    // NewChatDialog promotes the draft before handing off the created session.
+    promoteSessionDraft(tempConvId, "conv_cancelled");
+    hydrateLocalConversation(
+      tempConvId,
+      "conv_cancelled",
+      "agent_xyz",
+      text,
+      [file],
+      pendingMsgTempId,
+      skill,
+      navigate,
+    );
+    await tick();
+    await tick();
+
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toEqual([]);
+    expect(
+      fetchMock.mock.calls.filter(([url]) => String(url) === "/v1/sessions/conv_cancelled/stream"),
+    ).toHaveLength(1);
+    expect(navigate).toHaveBeenCalledWith("/c/conv_cancelled", { replace: true });
+    expect(useChatStore.getState()).toMatchObject({
+      conversationId: "conv_cancelled",
+      status: "idle",
+      loadingConversation: false,
+      pendingUserMessages: [],
+      failedSendDraft: { conversationId: "conv_cancelled", text, files: [file] },
+    });
+    expect(useChatStore.getState().abortController?.signal.aborted).toBe(false);
+    expect(getSessionDraft(tempConvId)).toBeUndefined();
+    expect(getSessionDraft("conv_cancelled")).toEqual({ text, files: [file] });
+  });
+
+  it("preserves a newer draft and does not navigate away from another conversation", async () => {
+    seedSession("conv_cancelled");
+    seedSession("conv_other");
+    const { tempConvId, pendingMsgTempId } = beginLocalConversation(
+      "cancel this initial prompt",
+      undefined,
+    )!;
+    const newerFile = new File(["correction"], "correction.txt", { type: "text/plain" });
+    const newerDraft = { text: "use these corrected instructions", files: [newerFile] };
+    setSessionDraft(tempConvId, newerDraft);
+
+    useChatStore.getState().stop();
+    expect(getSessionDraft(tempConvId)).toEqual(newerDraft);
+    await useChatStore.getState().switchTo("conv_other");
+    const otherDraft = { text: "unrelated work", files: [] };
+    setSessionDraft("conv_other", otherDraft);
+    const navigate = vi.fn();
+
+    promoteSessionDraft(tempConvId, "conv_cancelled");
+    hydrateLocalConversation(
+      tempConvId,
+      "conv_cancelled",
+      "agent_xyz",
+      "cancel this initial prompt",
+      undefined,
+      pendingMsgTempId,
+      null,
+      navigate,
+    );
+    await tick();
+    await tick();
+
+    expect(navigate).not.toHaveBeenCalled();
+    expect(useChatStore.getState()).toMatchObject({
+      conversationId: "conv_other",
+      status: "idle",
+      pendingUserMessages: [],
+      failedSendDraft: null,
+    });
+    expect(getSessionDraft("conv_other")).toEqual(otherDraft);
+    expect(getSessionDraft("conv_cancelled")).toEqual(newerDraft);
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toEqual([]);
+    expect(conversationRegistry.peek("conv_cancelled")?.getState()).toMatchObject({
+      status: "idle",
+      pendingUserMessages: [],
+      failedSendDraft: { conversationId: "conv_cancelled" },
+    });
+  });
+});
+
+describe("chatStore — first message during native model startup", () => {
+  const sessionId = "conv_native_startup";
+  const original = "unfinished first prompt";
+  let harness = "claude-native";
+
+  beforeEach(() => {
+    harness = "claude-native";
+    clearSessionDrafts();
+    seedSession(sessionId);
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).split("?")[0] === `/v1/sessions/${sessionId}`) {
+        return mockResponse({
+          id: sessionId,
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          harness,
+          labels: {
+            "omnigent.wrapper":
+              harness === "claude-native" ? "claude-code-native-ui" : "codex-native-ui",
+          },
+          llm_model: null,
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+  });
+  afterEach(clearSessionDrafts);
+
+  function begin(files?: File[]): void {
+    const { tempConvId, pendingMsgTempId } = beginLocalConversation(
+      original,
+      files,
+      undefined,
+      undefined,
+      { modelOverride: harness === "claude-native" ? "haiku" : "gpt-5.6", harness },
+    )!;
+    hydrateLocalConversation(
+      tempConvId,
+      sessionId,
+      "agent_xyz",
+      original,
+      files,
+      pendingMsgTempId,
+      null,
+      () => {},
+    );
+  }
+
+  function reportModel(): void {
+    handleSessionEvent(
+      { type: "session_model", conversationId: sessionId, model: "haiku" },
+      sessionId,
+    );
+  }
+
+  function eventBodies(): { type: string; data: Record<string, unknown> }[] {
+    return fetchMock.mock.calls
+      .filter(([url, init]) => String(url).endsWith("/events") && init?.method === "POST")
+      .map(([, init]) => JSON.parse(init.body as string));
+  }
+
+  async function settle(): Promise<void> {
+    await tick();
+    await tick();
+  }
+
+  it("keeps the first draft local until the model reports, then hands Interrupt to the runner", async () => {
+    begin();
+    await settle();
+    expect(useChatStore.getState()).toMatchObject({
+      conversationId: sessionId,
+      sessionModelSeeded: true,
+      pendingUserMessages: [{ initialDraft: { text: original, files: [] } }],
+    });
+    expect(eventBodies()).toEqual([]);
+
+    handleSessionEvent({ type: "session_status", conversationId: sessionId, status: "idle" });
+    expect(useChatStore.getState().pendingUserMessages[0]?.initialDraft).toBeDefined();
+    reportModel();
+    await settle();
+
+    expect(eventBodies()).toEqual([
+      {
+        type: "message",
+        data: expect.objectContaining({ content: [{ type: "input_text", text: original }] }),
+      },
+    ]);
+    expect(useChatStore.getState().pendingUserMessages[0]?.initialDraft).toBeUndefined();
+    expect(useChatStore.getState().status).toBe("streaming");
+    useChatStore.getState().stop();
+    await settle();
+    expect(eventBodies().at(-1)?.type).toBe("interrupt");
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+
+  it("cancels and restores repeated corrected drafts before native startup finishes", async () => {
+    begin();
+    await settle();
+    const cancelAndExpectDraft = (text: string) => {
+      useChatStore.getState().stop();
+      expect(useChatStore.getState().failedSendDraft).toMatchObject({
+        conversationId: sessionId,
+        text,
+        files: [],
+      });
+      expect(eventBodies()).toEqual([]);
+    };
+    const correctAndCancel = async (text: string) => {
+      setSessionDraft(sessionId, { text: "", files: [] });
+      useChatStore.setState({ failedSendDraft: null });
+      const sending = useChatStore.getState().send(text, "agent_xyz");
+      await settle();
+      cancelAndExpectDraft(text);
+      await sending;
+    };
+    cancelAndExpectDraft(original);
+    await correctAndCancel("first correction");
+    await correctAndCancel("second correction");
+
+    const corrected = useChatStore.getState().send("final correction", "agent_xyz");
+    reportModel();
+    await corrected;
+    expect(eventBodies()).toEqual([
+      {
+        type: "message",
+        data: expect.objectContaining({
+          content: [{ type: "input_text", text: "final correction" }],
+        }),
+      },
+    ]);
+  });
+
+  it("does not wait for Codex's first-turn model report or own its subsequent sends locally", async () => {
+    harness = "codex-native";
+    begin();
+    await settle();
+
+    expect(eventBodies()).toHaveLength(1);
+    expect(useChatStore.getState().sessionModelSeeded).toBe(true);
+    expect(useChatStore.getState().pendingUserMessages[0]?.initialDraft).toBeUndefined();
+    useChatStore.getState().stop();
+    await settle();
+    expect(eventBodies().at(-1)?.type).toBe("interrupt");
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+
+    const following = useChatStore.getState().send("a later Codex message", "agent_xyz");
+    expect(useChatStore.getState().pendingUserMessages[0]?.initialDraft).toBeUndefined();
+    await following;
+    expect(eventBodies().at(-1)?.type).toBe("message");
+  });
+
+  it("waits on the background conversation's model rather than the visible conversation", async () => {
+    begin();
+    await settle();
+    seedSession("conv_other");
+    await useChatStore.getState().switchTo("conv_other");
+    reportModel();
+    await settle();
+
+    expect(eventBodies()).toHaveLength(1);
+    expect(useChatStore.getState()).toMatchObject({
+      conversationId: "conv_other",
+      pendingUserMessages: [],
+      status: "idle",
+      failedSendDraft: null,
+    });
+    expect(conversationRegistry.peek(sessionId)?.getState().pendingUserMessages[0]?.posted).toBe(
+      true,
+    );
+  });
+
+  it.each([false, true])(
+    "does not dispatch or restore a canceled draft when binding settles (failed=%s)",
+    async (failed) => {
+      const baseFetch = fetchMock.getMockImplementation()!;
+      let releaseBind!: () => void;
+      fetchMock.mockImplementation((input, init) => {
+        if (String(input).split("?")[0] === `/v1/sessions/${sessionId}`) {
+          return new Promise<Response>((resolve) => {
+            releaseBind = () =>
+              resolve(
+                failed ? mockResponse({}, { ok: false, status: 500 }) : baseFetch(input, init),
+              );
+          });
+        }
+        return baseFetch(input, init);
+      });
+      begin();
+      await settle();
+      useChatStore.getState().stop();
+      setSessionDraft(sessionId, { text: "newer correction", files: [] });
+      useChatStore.setState({ failedSendDraft: null });
+      releaseBind();
+      await settle();
+
+      expect(eventBodies()).toEqual([]);
+      expect(getSessionDraft(sessionId)?.text).toBe("newer correction");
+      expect(useChatStore.getState().failedSendDraft).toBeNull();
+      expect(useChatStore.getState().blocks.filter((b) => b.type === "error")).toEqual([]);
+    },
+  );
+
+  it.each([false, true])(
+    "never posts an initial message canceled during upload (failed=%s)",
+    async (failed) => {
+      const file = new File(["notes"], "notes.txt", { type: "text/plain" });
+      const baseFetch = fetchMock.getMockImplementation()!;
+      let releaseUpload!: () => void;
+      fetchMock.mockImplementation((input, init) => {
+        if (String(input).endsWith("/resources/files")) {
+          return new Promise<Response>((resolve) => {
+            releaseUpload = () =>
+              resolve(
+                failed
+                  ? mockResponse({}, { ok: false, status: 500 })
+                  : mockResponse({ id: "file_uploaded" }),
+              );
+          });
+        }
+        return baseFetch(input, init);
+      });
+      begin([file]);
+      await settle();
+      reportModel();
+      await settle();
+      expect(releaseUpload).toBeDefined();
+
+      useChatStore.getState().stop();
+      expect(useChatStore.getState().failedSendDraft?.files[0]).toBe(file);
+      releaseUpload();
+      await settle();
+
+      expect(eventBodies()).toEqual([]);
+      expect(useChatStore.getState().failedSendDraft).toMatchObject({
+        text: original,
+        files: [file],
+      });
+      expect(useChatStore.getState().blocks.filter((b) => b.type === "error")).toEqual([]);
+    },
+  );
+
+  it("restores the draft when native startup fails without dispatching", async () => {
+    begin();
+    await settle();
+    handleSessionEvent({ type: "session_status", conversationId: sessionId, status: "failed" });
+    await settle();
+
+    expect(eventBodies()).toEqual([]);
+    expect(useChatStore.getState()).toMatchObject({
+      status: "idle",
+      pendingUserMessages: [],
+      failedSendDraft: { conversationId: sessionId, text: original, files: [] },
+    });
+    expect(useChatStore.getState().blocks.some((b) => b.type === "error")).toBe(true);
+  });
+
+  it("bounds the model wait and restores the draft instead of silently sending it", async () => {
+    vi.useFakeTimers();
+    begin();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(eventBodies()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(180_000);
+
+    expect(eventBodies()).toEqual([]);
+    expect(useChatStore.getState()).toMatchObject({
+      status: "idle",
+      pendingUserMessages: [],
+      failedSendDraft: { conversationId: sessionId, text: original, files: [] },
+    });
+    expect(useChatStore.getState().blocks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "error",
+          message: expect.stringContaining("model did not finish starting"),
+        }),
+      ]),
+    );
+  });
+
+  it("abandons the waiting send when its conversation is disposed", async () => {
+    begin();
+    await settle();
+    conversationRegistry.release(sessionId);
+    reportModel();
+    await settle();
+
+    expect(eventBodies()).toEqual([]);
+    expect(conversationRegistry.peek(sessionId)).toBeUndefined();
+  });
+});
+
+describe("chatStore — sending during a model switch", () => {
+  const sessionId = "conv_model_switch_send";
+
+  beforeEach(clearSessionDrafts);
+  afterEach(clearSessionDrafts);
+
+  async function beginModelSwitch(): Promise<() => Promise<void>> {
+    seedSession(sessionId, [
+      userMessage("previous", "hello"),
+      assistantMessage("previous", "hello"),
+    ]);
+    let releasePatch!: (response: Response) => void;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).split("?")[0] === `/v1/sessions/${sessionId}`) {
+        if (init?.method === "PATCH") {
+          return new Promise<Response>((resolve) => {
+            releasePatch = resolve;
+          });
+        }
+        return mockResponse({
+          id: sessionId,
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          harness: "claude-native",
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          llm_model: "haiku",
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().switchTo(sessionId);
+    expect(useChatStore.getState()).toMatchObject({
+      status: "idle",
+      sessionModelSeeded: false,
+      llmModel: "haiku",
+    });
+    const changingModel = useChatStore.getState().setModel("sonnet", { expectConfirmation: true });
+    await tick();
+    expect(useChatStore.getState().pendingModelChange).toBe("sonnet");
+    return async () => {
+      handleSessionEvent(
+        { type: "session_model", conversationId: sessionId, model: "sonnet" },
+        sessionId,
+      );
+      releasePatch(mockResponse({ id: sessionId, model_override: "sonnet" }));
+      await changingModel;
+    };
+  }
+
+  function eventBodies(): { type: string; data: Record<string, unknown> }[] {
+    return fetchMock.mock.calls
+      .filter(([url, init]) => String(url).endsWith("/events") && init?.method === "POST")
+      .map(([, init]) => JSON.parse(init.body as string));
+  }
+
+  it("keeps an existing session's message local until the model switch is confirmed", async () => {
+    const confirmModel = await beginModelSwitch();
+    const sending = useChatStore.getState().send("use the new model", "agent_xyz");
+    await tick();
+    expect(eventBodies()).toEqual([]);
+
+    await confirmModel();
+    await sending;
+    expect(eventBodies()).toEqual([
+      {
+        type: "message",
+        data: expect.objectContaining({
+          content: [{ type: "input_text", text: "use the new model" }],
+        }),
+      },
+    ]);
+    expect(useChatStore.getState().pendingUserMessages[0]?.initialDraft).toBeUndefined();
+  });
+
+  it("restores a stopped draft and sends only its correction after the model switch", async () => {
+    const confirmModel = await beginModelSwitch();
+    const sending = useChatStore.getState().send("unfinished instructions", "agent_xyz");
+    await tick();
+    useChatStore.getState().stop();
+    await sending;
+
+    expect(useChatStore.getState()).toMatchObject({
+      status: "idle",
+      pendingUserMessages: [],
+      pendingModelChange: "sonnet",
+      failedSendDraft: { conversationId: sessionId, text: "unfinished instructions", files: [] },
+    });
+    expect(getSessionDraft(sessionId)).toEqual({ text: "unfinished instructions", files: [] });
+    expect(eventBodies()).toEqual([]);
+
+    setSessionDraft(sessionId, { text: "", files: [] });
+    useChatStore.setState({ failedSendDraft: null });
+    const corrected = useChatStore.getState().send("corrected instructions", "agent_xyz");
+    await tick();
+    expect(eventBodies()).toEqual([]);
+    const correctedPending = useChatStore.getState().pendingUserMessages;
+    handleSessionEvent(
+      {
+        type: "slash_command",
+        kind: "command",
+        name: "model",
+        arguments: "sonnet",
+        output: null,
+        agentName: "claude-native-ui",
+        itemId: "item_model_switch",
+        responseId: "response_model_switch",
+      },
+      sessionId,
+    );
+    expect(useChatStore.getState().pendingUserMessages).toEqual(correctedPending);
+    await confirmModel();
+    await corrected;
+
+    expect(eventBodies()).toEqual([
+      {
+        type: "message",
+        data: expect.objectContaining({
+          content: [{ type: "input_text", text: "corrected instructions" }],
+        }),
+      },
+    ]);
+  });
+
+  it("still interrupts an active response while restoring a model-switch draft", async () => {
+    const confirmModel = await beginModelSwitch();
+    useChatStore.setState({
+      status: "streaming",
+      sessionStatus: "running",
+      activeResponse: { responseId: "response_active", state: "streaming", error: null },
+    });
+    const sending = useChatStore.getState().send("unfinished steering instructions", "agent_xyz");
+    await tick();
+    useChatStore.getState().stop();
+    await sending;
+
+    expect(useChatStore.getState()).toMatchObject({
+      status: "idle",
+      sessionStatus: "idle",
+      pendingUserMessages: [],
+      activeResponse: { responseId: "response_active", state: "cancelled" },
+      failedSendDraft: {
+        conversationId: sessionId,
+        text: "unfinished steering instructions",
+        files: [],
+      },
+    });
+    await confirmModel();
+    await tick();
+    expect(eventBodies()).toEqual([expect.objectContaining({ type: "interrupt" })]);
+  });
+});
+
 describe("chatStore — sendSlashCommand", () => {
   /** Parse the JSON body of the single POST /events call. */
   function lastEventBody(): { type: string; data: Record<string, unknown> } {
@@ -6354,6 +6930,33 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   });
 
   describe("session.input.consumed", () => {
+    it.each([false, true])(
+      "does not consume an unsent model-switch draft (already mirrored=%s)",
+      (alreadyMirrored) => {
+        const event: SessionInputConsumedEvent = {
+          type: "session_input_consumed",
+          itemId: "msg_from_terminal",
+          itemType: "message",
+          data: { role: "user", content: [{ type: "input_text", text: "from the terminal" }] },
+        };
+        useChatStore.setState({ blocks: [], pendingUserMessages: [] });
+        if (alreadyMirrored) handleSessionEvent(event);
+        const pending: PendingUserMessage = {
+          tempId: "pend_unsent",
+          content: [{ type: "input_text", text: "waiting for the model switch" }],
+          initialDraft: { text: "waiting for the model switch", files: [] },
+        };
+        useChatStore.setState({ pendingUserMessages: [pending] });
+
+        handleSessionEvent(event);
+
+        expect(useChatStore.getState().pendingUserMessages).toEqual([pending]);
+        expect(useChatStore.getState().blocks).toMatchObject([
+          { ctx: { itemId: event.itemId }, content: event.data.content },
+        ]);
+      },
+    );
+
     it("promotes the oldest pending user message into blocks (FIFO, plain append)", () => {
       const existingAssistant: AnyBlock = {
         type: "text_done",

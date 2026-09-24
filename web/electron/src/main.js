@@ -39,6 +39,11 @@ const { pathToFileURL } = require("node:url");
 const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
 const {
+  registerBrowserPermissions,
+  createBrowserPermissionStore,
+} = require("./browserPermissions");
+const { createBrowserPermissionPrompt } = require("./browserPermissionPrompt");
+const {
   normalizeUrl,
   normalizeRecentServers,
   expandDatabricksWorkspaceUrl,
@@ -139,6 +144,31 @@ function serverSelectorV2DevUrl() {
 }
 
 /**
+ * Dev-only onboarding mock, driven by env vars so the wizard's four desktop
+ * variants can be exercised in the real Electron shell without MDM / a real
+ * server. Translates OMNIGENT_ONBOARDING_MOCK* into the `?mock=1&…` query the
+ * renderer's mockSetup.ts reads. Empty (no query) unless the mock is on, and
+ * never active in a packaged build. See web/src/pages/onboarding/mockSetup.ts.
+ *
+ *   OMNIGENT_ONBOARDING_MOCK=1                 enable
+ *   OMNIGENT_ONBOARDING_MOCK_MANAGED=url,url   MDM-preset servers
+ *   OMNIGENT_ONBOARDING_MOCK_RECENTS=url,url   recent servers
+ *   OMNIGENT_ONBOARDING_MOCK_INSTALLED=1       returning user
+ *
+ * @returns {string} A query string without the leading "?", or "".
+ */
+function onboardingMockSearch() {
+  if (app.isPackaged || process.env.OMNIGENT_ONBOARDING_MOCK !== "1") return "";
+  const p = new URLSearchParams({ mock: "1" });
+  if (process.env.OMNIGENT_ONBOARDING_MOCK_MANAGED)
+    p.set("managed", process.env.OMNIGENT_ONBOARDING_MOCK_MANAGED);
+  if (process.env.OMNIGENT_ONBOARDING_MOCK_RECENTS)
+    p.set("recents", process.env.OMNIGENT_ONBOARDING_MOCK_RECENTS);
+  if (process.env.OMNIGENT_ONBOARDING_MOCK_INSTALLED === "1") p.set("installed", "1");
+  return p.toString();
+}
+
+/**
  * Load the setup page (or server selector) into `win`, appending `search`
  * (a query string without the leading "?", or empty).
  *
@@ -156,11 +186,22 @@ function serverSelectorV2DevUrl() {
  */
 function loadSetupPage(win, search = "") {
   abortConnectionAttempt(win);
-  const loadFile = () => win.loadFile(setupPagePath(), search ? { search } : undefined);
+  // Fold in the dev-only onboarding mock (env-driven); caller params win on
+  // conflict. No-op in packaged builds / when the mock is off.
+  const mock = onboardingMockSearch();
+  let effectiveSearch = search;
+  if (mock) {
+    const merged = new URLSearchParams(mock);
+    for (const [k, v] of new URLSearchParams(search)) merged.set(k, v);
+    effectiveSearch = merged.toString();
+  }
+  const loadFile = () =>
+    win.loadFile(setupPagePath(), effectiveSearch ? { search: effectiveSearch } : undefined);
   const devUrl = serverSelectorV2DevUrl();
   const run = () => {
     if (win.isDestroyed()) return Promise.resolve();
-    if (devUrl) return win.loadURL(search ? `${devUrl}?${search}` : devUrl).catch(loadFile);
+    if (devUrl)
+      return win.loadURL(effectiveSearch ? `${devUrl}?${effectiveSearch}` : devUrl).catch(loadFile);
     return loadFile();
   };
   return new Promise((resolve) => {
@@ -1010,6 +1051,14 @@ const returnBanner = createReturnBanner({
   bannerPage: path.join(__dirname, "..", "return-banner", "index.html"),
   preloadPath: path.join(__dirname, "return_banner_preload.js"),
   onGoBack: (win) => awayWatches.get(win)?.reset(),
+});
+
+const browserPermissionStore = createBrowserPermissionStore({ loadSettings, saveSettings });
+const browserPermissionPrompt = createBrowserPermissionPrompt({
+  BrowserWindow,
+  ipcMain,
+  promptPage: path.join(__dirname, "..", "browser-permission", "index.html"),
+  preloadPath: path.join(__dirname, "browser_permission_preload.js"),
 });
 
 /** Per-window away-watch handles (win → {reset, dispose}); see away_banner.js. */
@@ -2466,15 +2515,14 @@ function buildMenu() {
     template.push({ label: "Help", submenu: [aboutItem] });
   }
 
-  // Consolidate non-production affordances behind one top-level menu. It is
+  // Consolidate developer affordances behind one top-level menu. It is
   // always present in development and can be explicitly enabled in a packaged
   // macOS app through the DeveloperMode user default. Restart-to-update stays
   // in the production Server menu because it is a normal install path.
   if (developerModeEnabled()) {
     /** @type {Electron.MenuItemConstructorOptions[]} */
-    const debugSubmenu = [];
-    if (!app.isPackaged) {
-      debugSubmenu.push({
+    const debugSubmenu = [
+      {
         id: "debug_authentication",
         label: "Authentication",
         submenu: [
@@ -2494,8 +2542,8 @@ function buildMenu() {
             click: () => void changeCachedOAuthToken("refresh"),
           },
         ],
-      });
-    }
+      },
+    ];
 
     // macOS notification-sound settings: an on/off switch plus a picker of
     // system sounds. Selections persist in settings.json and are read live by
@@ -2637,27 +2685,15 @@ function isPinnedOriginSender(event) {
 // See preload.js + README.
 // ---------------------------------------------------------------------------
 
-/**
- * Deny-all permission handlers for an agent view's storage partition.
- *
- * SECURITY: agent views live on per-conversation partitions (storage isolation
- * — see browserViewRegistry), NOT on `session.defaultSession`, so the shell's
- * permission handlers (registerPermissions) do not cover them. A session with
- * NO handler auto-grants every permission request in Electron, so each new
- * partition gets an explicit deny-all before its first page loads. Agent-
- * visited pages never legitimately need mic/camera/notifications from the
- * shell; on defaultSession they were already denied (grants require the
- * pinned server origin), so deny-all preserves the old posture. Re-installing
- * on a partition that already has the handlers is an idempotent no-op, so no
- * per-partition memo is kept (a failed install is retried on the next view).
- *
- * @param {string | undefined} partition
- */
-function hardenAgentPartition(partition) {
-  if (!partition) return;
+/** Deny browser permissions except user-approved local network access. */
+function hardenAgentPartition(partition, win, canPrompt, getAnchorBounds) {
   const ses = session.fromPartition(partition);
-  ses.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
-  ses.setPermissionCheckHandler(() => false);
+  return registerBrowserPermissions(ses, {
+    canPrompt,
+    store: browserPermissionStore,
+    showPrompt: (options) =>
+      browserPermissionPrompt.show({ parent: win, getAnchorBounds, ...options }),
+  });
 }
 
 /**
@@ -2668,17 +2704,30 @@ function hardenAgentPartition(partition) {
  * @returns {ReturnType<typeof createBrowserViewRegistry>}
  */
 function createBrowserRegistryForWindow(win) {
-  return createBrowserViewRegistry({
+  const canPrompt = (wc) =>
+    !win.isDestroyed() &&
+    win.isVisible() &&
+    !win.isMinimized() &&
+    !registry.isSuppressed() &&
+    registry.get(registry.activeConversationId())?.view.webContents === wc;
+  const registry = createBrowserViewRegistry({
     WebContentsViewCtor: (opts) => {
-      // Harden the view's partition before construction so no page can race a
-      // permission request ahead of the deny-all handlers.
-      hardenAgentPartition(opts && opts.webPreferences && opts.webPreferences.partition);
-      return new WebContentsView(opts);
+      // Install before construction: Electron otherwise auto-grants requests.
+      const policy = hardenAgentPartition(opts.webPreferences.partition, win, canPrompt, () =>
+        view.getBounds(),
+      );
+      const view = new WebContentsView(opts);
+      policy.attach(view.webContents);
+      return view;
+    },
+    onSuppressionChange: (suppressed) => {
+      if (suppressed) browserPermissionPrompt.dismiss(win);
     },
     createBoundsController: createBrowserViewBoundsController,
     attachToHost: (view) => win.contentView.addChildView(view),
     detachFromHost: (view) => win.contentView.removeChildView(view),
     sendToRenderer: (channel, payload) => {
+      if (channel === "browser-host-active-changed") browserPermissionPrompt.dismiss(win);
       try {
         win.webContents.send(channel, payload);
       } catch {
@@ -2700,6 +2749,7 @@ function createBrowserRegistryForWindow(win) {
       Menu.buildFromTemplate(items).popup({ window: win });
     },
   });
+  return registry;
 }
 
 /**
@@ -3318,6 +3368,7 @@ function registerIpc() {
   // The module owns the handlers and their trusted-sender + consent gates.
   updater.registerIpc();
   aboutWindow.registerIpc();
+  browserPermissionPrompt.registerIpc();
   updateOverlay.registerIpc();
   returnBanner.registerIpc();
 

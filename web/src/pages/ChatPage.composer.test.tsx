@@ -374,6 +374,87 @@ describe("Composer session drafts", () => {
   });
 });
 
+describe("Composer starting-session cancellation", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    setComposerState({
+      conversationId: "temp:cancel_initial",
+      blocks: [],
+      failedSendDraft: null,
+      pendingUserMessages: [],
+      queuedMessages: [],
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+    setComposerState({ pendingUserMessages: [] });
+  });
+
+  it.each(["button", "Escape"])(
+    "keeps Interrupt available with a typed draft and cancels using %s",
+    (trigger) => {
+      const props = composerProps({
+        status: "streaming",
+        isWorking: true,
+        disabled: true,
+        unreachable: true,
+        permissionLevel: 1,
+        sendDisabledReason: "Starting the session…",
+      });
+      render(<Composer {...props} />);
+
+      fireEvent.change(textarea(), { target: { value: "a correction while choosing a model" } });
+      expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(props.onStop).not.toHaveBeenCalled();
+
+      if (trigger === "button") {
+        fireEvent.click(screen.getByRole("button", { name: "Interrupt" }));
+      } else {
+        fireEvent.keyDown(textarea(), { key: "Escape" });
+      }
+
+      expect(props.onStop).toHaveBeenCalledOnce();
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(textarea()).toHaveValue("a correction while choosing a model");
+    },
+  );
+
+  it.each(["button", "Escape"])(
+    "keeps Interrupt available after real-ID promotion with a typed draft using %s",
+    (trigger) => {
+      setComposerState({
+        conversationId: "conv_initial_model_pending",
+        sessionStatus: "idle",
+        pendingUserMessages: [
+          {
+            tempId: "pend_initial",
+            content: [{ type: "input_text", text: "original task" }],
+            initialDraft: { text: "original task", files: [] },
+          },
+        ],
+      });
+      const props = composerProps({ status: "idle", isWorking: true });
+      render(<Composer {...props} />);
+      fireEvent.change(textarea(), { target: { value: "corrected task" } });
+      expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+
+      if (trigger === "button") {
+        fireEvent.click(screen.getByRole("button", { name: "Interrupt" }));
+      } else {
+        fireEvent.keyDown(textarea(), { key: "Escape" });
+      }
+
+      expect(props.onStop).toHaveBeenCalledOnce();
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(textarea()).toHaveValue("corrected task");
+    },
+  );
+});
+
 describe("Composer growth layout", () => {
   afterEach(() => {
     cleanup();
@@ -581,6 +662,23 @@ describe("Composer send shortcut", () => {
 
       fireEvent.focus(screen.getByRole("button", { name: "Send" }));
       expect(screen.queryByRole("tooltip")).toBeNull();
+    } finally {
+      restorePointer();
+    }
+  });
+
+  it("leaves plain Enter as a newline on a coarse pointer, even with no menu open", async () => {
+    // Touch keyboards own the send action (the on-screen button), so Enter on
+    // a coarse pointer must stay a plain newline — same rule the landing
+    // composer follows on a phone viewport.
+    const restorePointer = forceDesktopCoarsePointer();
+    const onSend = vi.fn();
+    try {
+      const user = userEvent.setup();
+      render(<Composer {...composerProps({ onSend })} />);
+      await user.type(textarea(), "first{Enter}second");
+      expect(textarea().value).toBe("first\nsecond");
+      expect(onSend).not.toHaveBeenCalled();
     } finally {
       restorePointer();
     }
@@ -2167,7 +2265,7 @@ describe("Composer shared visible controls", () => {
     expect(screen.queryByTestId("composer-git-branch")).toBeNull();
   });
 
-  it("keeps the PR to the left of the confirmed worktree status", () => {
+  it("keeps the PR to the right of the confirmed worktree status", () => {
     setComposerGitStatus({
       branch: "feature/shared-composer",
       branchState: "branch",
@@ -2181,7 +2279,7 @@ describe("Composer shared visible controls", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     const pr = screen.getByTestId("composer-pr-link");
     const worktree = screen.getByTestId("composer-git-branch");
-    expect(pr.compareDocumentPosition(worktree) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(worktree.compareDocumentPosition(pr) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
   });
 
   it("mounts task indicators before the context ring with sub-agent navigation", () => {
@@ -3816,6 +3914,138 @@ describe("Composer file-attachment focus", () => {
 
     expect(screen.queryByText(/can't be attached/)).toBeNull();
   });
+
+  it("clears the rejection notice when the accepted chip is removed", () => {
+    // A mixed attach keeps the good file and flags the bad one; removing the
+    // surviving chip must also drop the stale notice (parity with the landing
+    // composer's mixed-drop behavior).
+    render(<Composer {...composerProps()} />);
+    const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
+    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    fireEvent.change(fileInput(), { target: { files: [ok, bad] } });
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.getByText(/can't be attached/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove notes.txt" }));
+
+    expect(screen.queryByText(/can't be attached/)).toBeNull();
+  });
+});
+
+// Paste mirrors drop on the in-session composer: files on the clipboard attach
+// instead of inserting as text, while a plain-text paste is left to the
+// browser. Same contract as the landing composer's paste suite.
+describe("Composer paste", () => {
+  beforeEach(() => {
+    setComposerState({ conversationId: "conv_test", skills: [] });
+    clearSessionDrafts();
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  /** Clipboard items as a real paste carries them: text and/or file entries. */
+  function pastePayload({ text, files = [] }: { text?: string; files?: File[] }) {
+    const items: {
+      kind: string;
+      type: string;
+      getAsFile: () => File | null;
+      getAsString?: (callback: (value: string) => void) => void;
+    }[] = [];
+    if (text !== undefined) {
+      items.push({
+        kind: "string",
+        type: "text/plain",
+        getAsFile: () => null,
+        getAsString: (callback) => callback(text),
+      });
+    }
+    for (const file of files) {
+      items.push({ kind: "file", type: file.type, getAsFile: () => file });
+    }
+    return { clipboardData: { items } };
+  }
+
+  it("leaves a text-only paste to the browser", () => {
+    render(<Composer {...composerProps()} />);
+    expect(fireEvent.paste(textarea(), pastePayload({ text: "hello world" }))).toBe(true);
+    expect(screen.queryByText(/can't be attached/)).toBeNull();
+    expect(textarea().value).toBe("");
+  });
+
+  it("attaches a pasted file instead of inserting it as text", () => {
+    render(<Composer {...composerProps()} />);
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    expect(fireEvent.paste(textarea(), pastePayload({ files: [file] }))).toBe(false);
+    expect(screen.getByAltText("shot.png")).toBeTruthy();
+    expect(textarea().value).toBe("");
+  });
+
+  it("attaches every file from a multi-file paste", () => {
+    render(<Composer {...composerProps()} />);
+    const image = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    const notes = new File(["hello"], "notes.txt", { type: "text/plain" });
+    expect(fireEvent.paste(textarea(), pastePayload({ files: [image, notes] }))).toBe(false);
+    expect(screen.getByAltText("shot.png")).toBeTruthy();
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+  });
+
+  it("attaches files pasted while the slash menu is open, closing the menu", () => {
+    // The slash menu only renders with no attachments (its visibility gate
+    // includes ``files.length === 0``), so pasting a file attaches it, keeps
+    // the drafted "/query" text, and dismisses the menu. The landing composer
+    // has no such gate — its menu stays open; the parity suite there records
+    // the divergence.
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name: "deslop", description: "Remove AI slop" }],
+    });
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "/de" } });
+    expect(activeRow()).not.toBeNull();
+
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    expect(fireEvent.paste(textarea(), pastePayload({ files: [file] }))).toBe(false);
+
+    expect(screen.getByAltText("shot.png")).toBeTruthy();
+    expect(textarea().value).toBe("/de");
+    expect(screen.queryByTestId("slash-menu-item-deslop")).toBeNull();
+  });
+});
+
+// A send that fails before the server takes ownership hands its text and
+// files back to the composer for retry. The files re-enter through the same
+// up-front validation as a fresh attach — when the upload itself was what
+// failed (a 415 on an unsupported type), re-arming that file would only
+// fail again, so it is dropped with the same inline reason.
+describe("Composer failed-send attachment restore", () => {
+  beforeEach(() => {
+    setComposerState({ conversationId: "conv_test", skills: [] });
+    clearSessionDrafts();
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("restores the retriable files and flags the ones current limits reject", () => {
+    render(<Composer {...composerProps()} />);
+    const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
+    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: { conversationId: "conv_test", text: "", files: [ok, bad] },
+      }),
+    );
+
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.queryByText("clip.mp4")).toBeNull();
+    expect(screen.getByText(/can't be attached/)).toBeTruthy();
+    // The store entry drained on restore, so the draft can't come back twice.
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
 });
 
 // The "Chatting with sub-agent …" tray peeks above the composer only when a
@@ -3883,7 +4113,6 @@ describe("Composer sub-agent tray", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     expect(screen.getByTestId("composer-workspace-controls")).toHaveClass(
       "rounded-t-none",
-      "pl-2.5",
       "border-t-0",
       "border-border/50",
       "before:inset-x-4",

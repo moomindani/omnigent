@@ -1,21 +1,4 @@
-"""Regression: a session reset must fence a terminal still being launched.
-
-The in-place agent-switch reset (``POST /reset-state``) closes the terminals
-``list_for_conversation`` returns at that moment and clears the agent-derived
-caches, but it does not stop a terminal creator already running.
-``TerminalRegistry.launch`` starts the terminal outside the registry lock and
-takes the slot only once the start completes, so without a fence at the
-registry's publication point a creator that is mid-launch when the reset lands
-registers its terminal *after* the reset finished — leaving the session holding
-a terminal that belongs to an agent it no longer runs.
-
-This drives ``TerminalRegistry.launch`` directly — the publication path shared
-by every creator, including ``sys_terminal_launch``, which never sees the
-runner app's per-context fences. Real-terminal timing is not stable enough to
-hit this window (the blocking fork/tmux spawn serialises the runner loop), so
-the launch is driven through a latched terminal-start stub; the reset is driven
-through the real ``POST /reset-state`` endpoint.
-"""
+"""Fence a registry launch paused before registration with a runner reset."""
 
 from __future__ import annotations
 
@@ -37,11 +20,7 @@ from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
 
 class _LatchedTerminalInstance:
-    """Terminal-instance stub whose ``launch`` blocks on a latch.
-
-    Signals ``entered`` when the launch begins (slot still empty) and completes
-    only once ``release`` is set, so a reset can land in between.
-    """
+    """Terminal stub whose launch waits for a reset to complete."""
 
     def __init__(self, inner: object, entered: asyncio.Event, release: asyncio.Event) -> None:
         self._inner = inner
@@ -113,7 +92,6 @@ async def test_reset_fences_a_terminal_that_is_still_launching(
     launch_task = asyncio.create_task(terminal_registry.launch(conv_id, "tui", "main", spec))
     await asyncio.wait_for(entered.wait(), timeout=10.0)
 
-    # Mid-launch: the slot is still empty, so the reset sees nothing to close.
     assert terminal_registry.get(conv_id, "tui", "main") is None
 
     transport = httpx.ASGITransport(app=app)
@@ -124,7 +102,6 @@ async def test_reset_fences_a_terminal_that_is_still_launching(
 
     assert terminal_registry.get(conv_id, "tui", "main") is None
     release.set()
-    # The fixed behavior: registration refused, instance discarded.
     with contextlib.suppress(TerminalLaunchSupersededError):
         await asyncio.wait_for(launch_task, timeout=10.0)
 

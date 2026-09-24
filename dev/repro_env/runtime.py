@@ -168,6 +168,9 @@ def supervise(output: Path) -> None:
         raise TimeoutError(f"not ready: {url}")
 
     try:
+        from .doctor import launch_observations
+
+        write_json(output / "launch-observations.json", launch_observations(root))
         env = dict(os.environ)
         claude_dir = output / "claude-config"
         claude_dir.mkdir(exist_ok=True)

@@ -329,12 +329,7 @@ async def test_supersede_inflight_launches_refuses_late_registration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A launch that finishes after supersession is closed, not registered.
-
-    The session reset closes only the terminals registered at that moment,
-    so a creator mid-start must not take the slot afterwards — it would
-    hand the session a terminal built from a spec the reset retired.
-    """
+    """A launch superseded mid-start closes without registering."""
     reg = TerminalRegistry()
     created = _LatchedTerminal(
         name="shell",

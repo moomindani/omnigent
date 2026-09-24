@@ -956,11 +956,13 @@ describe("Sidebar session list", () => {
     expect(search).toHaveAttribute("data-size", "icon-xs");
     expect(search).toHaveClass("size-6", "rounded-[var(--radius-md)]");
     expect(search).not.toHaveClass("rounded-sm");
-    expect(search.querySelector("svg")).toHaveClass("ui-icon");
+    expect(search.querySelector("svg")).toHaveClass("size-4");
+    expect(search.querySelector("svg")).not.toHaveClass("ui-icon");
     expect(settings).toHaveAttribute("aria-label", "Settings");
     expect(settings).toHaveAttribute("data-size", "icon-xs");
-    expect(settings).toHaveClass("size-6", "rounded-[var(--radius-md)]");
-    expect(settings.querySelector("svg")).toHaveClass("ui-icon");
+    expect(settings).toHaveClass("size-6", "rounded-[8px]");
+    expect(settings.querySelector("svg")).toHaveClass("size-4");
+    expect(settings.querySelector("svg")).not.toHaveClass("ui-icon");
     const collapse = within(headerActions).getByRole("button", { name: "Close sidebar" });
     expect(collapse).toHaveAttribute("data-size", "icon-xs");
     expect(collapse).toHaveClass("size-6", "rounded-[var(--radius-md)]");
@@ -1108,11 +1110,13 @@ describe("Sidebar session list", () => {
     const filterSessions = within(sessionsSection!).getByRole("button", {
       name: "Filter sessions",
     });
-    // The filter never fades; its wrapper re-enables hit-testing inside the
-    // pointer-events-gated outer box (see the overlay hit-test spec below).
-    expect(filterSessions.parentElement).not.toHaveClass("md:opacity-0");
-    expect(filterSessions.parentElement).toHaveClass("pointer-events-auto", "flex");
-    expect(filterSessions.parentElement!.parentElement).toHaveClass("absolute", "right-1", "flex");
+    // The filter never fades; its persistent-action wrapper re-enables hit-testing
+    // inside the pointer-events-gated outer box (see the overlay hit-test spec below).
+    const filterTooltipTrigger = filterSessions.parentElement!;
+    const filterPersistentAction = filterTooltipTrigger.parentElement!;
+    expect(filterTooltipTrigger).not.toHaveClass("md:opacity-0");
+    expect(filterPersistentAction).toHaveClass("pointer-events-auto", "flex");
+    expect(filterPersistentAction.parentElement).toHaveClass("absolute", "right-1", "flex");
 
     fireEvent.click(selectSessions);
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
