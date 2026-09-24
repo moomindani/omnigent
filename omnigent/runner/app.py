@@ -164,6 +164,7 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
     TerminalExitEvent,
     TerminalLifecycle,
+    terminal_launch_fence,
     trim_terminal_output,
 )
 from omnigent.runner.session_init_protocol import (
@@ -10771,6 +10772,8 @@ def create_runner_app(
         registration_is_current = _terminal_registration_fence(session_id)
 
         agent_spec = await _resolve_session_agent_spec(session_id)
+        if not registration_is_current():
+            return _session_reset_during_launch_response()
         agent_os_env = getattr(agent_spec, "os_env", None) if agent_spec is not None else None
 
         declared_terminal = None
@@ -10849,16 +10852,17 @@ def create_runner_app(
                 if bridge_inject
                 else resource_registry.launch_auxiliary_terminal
             )
-            resource_view = await launch_method(
-                session_id=session_id,
-                terminal_name=terminal_name,
-                session_key=session_key,
-                spec=env_spec,
-                cwd_override=cwd_override,
-                sandbox_override=sandbox_override,
-                parent_os_env=agent_os_env,
-                resource_role=(CLAUDE_NATIVE_TERMINAL_ROLE if bridge_inject else None),
-            )
+            with terminal_launch_fence(registration_is_current):
+                resource_view = await launch_method(
+                    session_id=session_id,
+                    terminal_name=terminal_name,
+                    session_key=session_key,
+                    spec=env_spec,
+                    cwd_override=cwd_override,
+                    sandbox_override=sandbox_override,
+                    parent_os_env=agent_os_env,
+                    resource_role=(CLAUDE_NATIVE_TERMINAL_ROLE if bridge_inject else None),
+                )
         except TerminalLaunchSupersededError:
             _logger.info(
                 "Discarding terminal %s:%s for %s: session was reset mid-launch",
@@ -10893,7 +10897,7 @@ def create_runner_app(
             )
             if launched_relay is not None:
                 _discard_comment_relay(session_id, launched_relay)
-            await resource_registry.close_terminal(session_id, resource_view.id)
+            await resource_registry.close_terminal_if_matching_view(session_id, resource_view)
             return _session_reset_during_launch_response()
 
         if bridge_inject:

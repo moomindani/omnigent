@@ -226,11 +226,18 @@ class TerminalRegistry:
             launch_generation = self._launch_generations.get(conversation_id, 0)
             existing = self._by_conversation.get(conversation_id, {}).get(key)
         if existing is not None and existing.running:
-            if await existing.is_alive():
+            alive = await existing.is_alive()
+            with self._lock:
+                superseded = self._launch_generations.get(conversation_id, 0) != launch_generation
+            if superseded:
+                raise TerminalLaunchSupersededError(
+                    f"terminal {terminal_name}:{session_key} was superseded by a reset"
+                )
+            if alive:
                 return existing
-            await self.close(conversation_id, terminal_name, session_key)
+            await self.close(conversation_id, terminal_name, session_key, expected=existing)
         elif existing is not None:
-            await self.close(conversation_id, terminal_name, session_key)
+            await self.close(conversation_id, terminal_name, session_key, expected=existing)
 
         # Lock-free section: ``create_terminal_instance`` and
         # ``launch`` may take real time (tmux spawn). Holding the
