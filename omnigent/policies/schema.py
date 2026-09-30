@@ -161,6 +161,9 @@ class EventContext(TypedDict, total=False):
         labels, e.g. ``{"cost_control.plan": "{...}"}``. Populated by
         the server-side engine; empty on paths that don't carry labels
         (the runner-local gate). Read via ``event["context"]["labels"]``.
+    :param conversation_id: The conversation this event belongs to.
+        Injected by the engine, which already owns this identity.
+        Read via ``event["context"]["conversation_id"]``.
     """
 
     actor: ActorContext
@@ -174,6 +177,9 @@ class EventContext(TypedDict, total=False):
     model: str | None
     harness: str | None
     labels: dict[str, str]
+    # ``str | None``: the value is ``ctx.conversation_id``, injected by the
+    # engine. ``None`` only in contexts with no engine.
+    conversation_id: str | None
 
 
 class PolicyEvent(TypedDict, total=False):
@@ -182,12 +188,13 @@ class PolicyEvent(TypedDict, total=False):
     Shape varies by ``type``:
 
     - ``"request"``: ``data`` is ``{"user_content": <str>,
-      "attachments": [{"filename", "content_type", "text"}, ...]}``
-      — the user's typed message plus the decoded text of any
-      uploaded text attachments (e.g. a CSV). Read it with
-      :func:`request_user_text` / :func:`request_attachments`
-      rather than assuming a bare string; those helpers also accept
-      a plain string for backward compatibility.
+      "attachments": [{"filename", "content_type", "text"}, ...]}``:
+      the user's typed message plus text attachments and files requiring
+      filesystem tools. Text files carry their decoded content; archives,
+      Office documents, and databases carry empty ``text`` so a policy can
+      inspect their names and types. Read it with :func:`request_user_text` /
+      :func:`request_attachments` rather than assuming a bare string;
+      those helpers also accept a plain string for backward compatibility.
     - ``"tool_call"``: ``data`` is ``{"name": "<tool-name>",
       "arguments": {...}}``. ``target`` is the tool name.
     - ``"tool_result"``: ``data`` is ``{"result": <tool-output>}``.

@@ -39,7 +39,9 @@ function loadNavigationHarness({
   registerFallbacks = true,
   databricksMode = "embedded",
   ensureSession = async (_ses, origin) => origin,
+  normalizeServer = (url) => url,
   expandWorkspace = async (url) => url,
+  realBrowserRegistry = false,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -76,6 +78,7 @@ function loadNavigationHarness({
   };
   const bannerCalls = { show: [], hide: 0 };
   const browserRegistryCalls = { setActive: [], closeAll: [] };
+  const permissionPromptCalls = { show: [], dismiss: [] };
   let currentUrl = serverUrl;
   const appEvents = new Map();
   const webContents = {
@@ -175,7 +178,9 @@ function loadNavigationHarness({
         getAllWindows: () => [],
       },
     ),
-    WebContentsView: function WebContentsView() {},
+    WebContentsView: function WebContentsView(opts) {
+      return electron.createWebContentsView(opts);
+    },
     Menu: { buildFromTemplate: () => ({}), setApplicationMenu: () => {} },
     Notification: { isSupported: () => false },
     clipboard: { writeText: () => {} },
@@ -195,9 +200,19 @@ function loadNavigationHarness({
       createUpdateOverlay: () => ({ ensureOverlay: () => {}, registerIpc: () => {} }),
     },
     "./localhost_cors": { registerLocalhostCors: () => {} },
+    "./browserPermissionPrompt": {
+      createBrowserPermissionPrompt: () => ({
+        show: async (options) => {
+          permissionPromptCalls.show.push(options);
+          return "deny";
+        },
+        dismiss: (parent) => permissionPromptCalls.dismiss.push(parent),
+        registerIpc() {},
+      }),
+    },
     "./url": {
       ...urlHelpers,
-      normalizeUrl: (url) => url,
+      normalizeUrl: normalizeServer,
       expandDatabricksWorkspaceUrl: expandWorkspace,
       fetchServerManifest: async (url) => {
         calls.manifests.push(url);
@@ -237,15 +252,19 @@ function loadNavigationHarness({
         registerIpc: () => {},
       }),
     },
-    "./browserViewRegistry": {
-      createBrowserViewRegistry: () => ({
-        closeAll: (reason) => browserRegistryCalls.closeAll.push(reason),
-        setActive: (conversationId) => browserRegistryCalls.setActive.push(conversationId),
-      }),
-    },
-    "./browserViewBounds": {
-      createBrowserViewBoundsController: () => ({ attach: () => {}, detach: () => {} }),
-    },
+    "./browserViewRegistry": realBrowserRegistry
+      ? require("../src/browserViewRegistry")
+      : {
+          createBrowserViewRegistry: () => ({
+            closeAll: (reason) => browserRegistryCalls.closeAll.push(reason),
+            setActive: (conversationId) => browserRegistryCalls.setActive.push(conversationId),
+          }),
+        },
+    "./browserViewBounds": realBrowserRegistry
+      ? require("../src/browserViewBounds")
+      : {
+          createBrowserViewBoundsController: () => ({ attach: () => {}, detach: () => {} }),
+        },
     "./browserIpc": { registerBrowserIpc: () => {} },
     "./session-expiry": require("../src/session-expiry"),
     "./popupPolicy": {
@@ -274,7 +293,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { createWindow, loadServerUrl, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; } };";
+    "\nmodule.exports.testApi = { createWindow, createBrowserRegistryForWindow, loadServerUrl, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; } };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -315,6 +334,8 @@ function loadNavigationHarness({
     calls,
     bannerCalls,
     browserRegistryCalls,
+    permissionPromptCalls,
+    electron,
     ipc,
     webRequest,
     webContents,
@@ -336,6 +357,34 @@ function loadNavigationHarness({
 
 describe("Databricks auth mode wiring", () => {
   const workspace = "https://workspace.cloud.databricks.com/omnigent";
+
+  it("connects a pasted HTTP workspace URL using HTTPS auth and the Omnigent mount", async (t) => {
+    const target = "https://workspace.cloud.databricks.com/omnigent?o=123";
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ headers: new Headers({ server: "databricks" }) });
+    t.after(() => {
+      globalThis.fetch = originalFetch;
+    });
+    const h = loadNavigationHarness({
+      serverUrl: target,
+      databricksMode: "browser",
+      normalizeServer: urlHelpers.normalizeUrl,
+      expandWorkspace: urlHelpers.expandDatabricksWorkspaceUrl,
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    await h.ipc.get("omnigent:set-server-url")(
+      { sender: h.webContents, senderFrame: { url: `file://${h.api.SETUP_PAGE}` } },
+      "http://workspace.cloud.databricks.com/omnigent?o=123",
+    );
+    assert.deepEqual(h.calls.loadURL, [[target]]);
+    assert.equal(h.calls.auth.length, 1);
+    assert.equal(h.calls.auth[0][1], "https://workspace.cloud.databricks.com");
+    assert.equal(h.api.windows.get(h.win).origin, "https://workspace.cloud.databricks.com");
+    const saved = JSON.parse(fs.readFileSync(h.settingsPath, "utf8"));
+    assert.equal(saved.server_url, target);
+    assert.deepEqual(saved.recent_servers, [target]);
+  });
   const tick = () =>
     new Promise((resolve) => {
       setTimeout(resolve, 5);
@@ -386,6 +435,21 @@ describe("Databricks auth mode wiring", () => {
     await h.api.loadServerUrl(h.win, workspace, "/c/deep-linked");
     assert.equal(h.calls.auth[1][2].interactive, false);
     assert.deepEqual(h.calls.loadURL[1], [`${workspace}/c/deep-linked`]);
+  });
+
+  it("upgrades a saved HTTP workspace before restoring authentication", async (t) => {
+    const target = "https://workspace.cloud.databricks.com/omnigent?o=123";
+    const h = loadNavigationHarness({
+      savedServerUrl: target.replace("https:", "http:"),
+      serverUrl: target,
+      databricksMode: "browser",
+    });
+    t.after(h.cleanup);
+    h.api.createWindow();
+    await tick();
+    assert.deepEqual(h.calls.loadURL, [[target]]);
+    assert.equal(h.calls.auth.length, 1);
+    assert.equal(h.calls.auth[0][1], "https://workspace.cloud.databricks.com");
   });
 
   it("never opens browser OAuth for the explicit embedded rollback or non-workspace servers", async (t) => {
@@ -684,6 +748,73 @@ describe("Databricks auth mode wiring", () => {
   });
 });
 
+describe("browser permission wiring", () => {
+  it("installs isolated consent handlers before construction and only prompts for the visible pane", async () => {
+    const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
+    try {
+      const sessions = new Map();
+      const prompts = h.permissionPromptCalls.show;
+      h.win.isVisible = () => true;
+      h.win.isMinimized = () => false;
+      h.electron.dialog.showMessageBox = () => assert.fail("must not use the OS alert");
+      h.electron.session.fromPartition = (partition) => {
+        if (!sessions.has(partition)) {
+          const ses = {
+            setPermissionRequestHandler: (handler) => (ses.request = handler),
+            setPermissionCheckHandler: (handler) => (ses.check = handler),
+          };
+          sessions.set(partition, ses);
+        }
+        return sessions.get(partition);
+      };
+      h.electron.createWebContentsView = function (opts) {
+        const ses = sessions.get(opts.webPreferences.partition);
+        assert.equal(typeof ses.request, "function");
+        assert.equal(typeof ses.check, "function");
+        const wc = new EventEmitter();
+        let url = "about:blank";
+        Object.assign(wc, {
+          session: ses,
+          getURL: () => url,
+          isDestroyed: () => false,
+          setWindowOpenHandler() {},
+          loadURL: (value) => (url = value),
+        });
+        return { webContents: wc, setVisible() {}, setBounds() {}, getBounds: () => ({}) };
+      };
+      const registry = h.api.createBrowserRegistryForWindow(h.win);
+      const a = registry.openOrNavigate("a", "https://login.example").entry.view.webContents;
+      const b = registry.openOrNavigate("b", "https://login.example").entry.view.webContents;
+      assert.notEqual(a.session, b.session);
+      const check = (wc) =>
+        wc.session.check(wc, "loopback-network", wc.getURL(), { isMainFrame: true });
+      assert.equal(check(a), false, "detached panes cannot prompt");
+      registry.setActive("a");
+      registry.setSuppressed(true);
+      assert.equal(check(a), false, "overlaid panes cannot prompt");
+      registry.setSuppressed(false);
+      assert.equal(check(b), false, "background conversations cannot prompt");
+      await new Promise(setImmediate);
+      assert.equal(prompts.length, 0);
+      assert.equal(check(a), false);
+      await new Promise(setImmediate);
+      assert.equal(prompts.length, 1);
+      assert.equal(prompts[0].parent, h.win);
+      assert.equal(prompts[0].origin, "https://login.example");
+      assert.equal(prompts[0].reload, true);
+      assert.equal(check(b), false, "Deny is shared across conversations");
+      const dismissals = h.permissionPromptCalls.dismiss.length;
+      registry.setSuppressed(true);
+      registry.setActive("b");
+      assert.equal(h.permissionPromptCalls.dismiss.length, dismissals + 2);
+      assert.equal(h.electron.session.defaultSession.request, undefined);
+      assert.equal(h.electron.session.defaultSession.check, undefined);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
 describe("setup clipboard IPC wiring", () => {
   it("exposes a narrow copy action through the setup bridge", () => {
     assert.match(
@@ -722,10 +853,50 @@ describe("managed server preference wiring", () => {
     );
   });
 
+  it("offers the onboarding remote environment only behind the host picker's gate plus arca", () => {
+    assert.match(
+      preloadSource,
+      /getRunnerOptions:\s*\(url\)\s*=>\s*ipcRenderer\.invoke\("omnigent:get-runner-options",\s*url\)/,
+    );
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:get-runner-options"[\s\S]{0,120}!isSetupPageSender\(event\)[\s\S]{0,200}typeof url === "string" &&\s*databricksInternalFeaturesEnabled\(\) &&\s*isDatabricksManagedServerUrl\(url\);\s*return \{ remote: internal && arca\.resolveArcaPath\(\) !== null, bundledCli: internal \}/,
+    );
+  });
+
+  it("wires the onboarding connect's remote gate, cancel-on-close, and sign-in order", () => {
+    assert.match(
+      preloadSource,
+      /connectRunner:\s*\(url, runner\)\s*=>\s*ipcRenderer\.invoke\("omnigent:connect-runner",\s*url,\s*runner\)/,
+    );
+    // The harness can't observe these (its arca and host stubs are fixed), so
+    // they stay source checks; the gates and cancellation are exercised below.
+    const start = liveCode.indexOf('ipcMain.handle("omnigent:connect-runner"');
+    const end = liveCode.indexOf('ipcMain.handle("omnigent:copy-setup-text"');
+    assert.ok(start >= 0 && end > start, "connect-runner handler not found before copy-setup-text");
+    const handler = liveCode.slice(start, end);
+    assert.match(
+      handler,
+      /runner === "remote"[\s\S]{0,80}!databricksInternalFeaturesEnabled\(\) \|\| !isDatabricksManagedServerUrl\(target\)[\s\S]{0,200}arca\.startArcaConnect\(target/,
+    );
+    assert.match(
+      handler,
+      /event\.sender\.once\("destroyed", cancel\);\s*const result = await run\.promise;\s*event\.sender\.removeListener\("destroyed", cancel\);/,
+    );
+    assert.match(
+      handler,
+      /hostCliCommand\(target\)[\s\S]{0,500}serverManager\.ensureServerAuth\(cliCommand, target\)[\s\S]{0,150}serverManager\.ensureHostConnected\(cliCommand, target\)/,
+    );
+  });
+
   it("preserves a managed path while still expanding bare workspace roots", () => {
     assert.match(
       liveCode,
-      /managedTarget\s*\?\?\s*normalizeUrl\(url\)[\s\S]{0,120}await expandDatabricksWorkspaceUrl\(normalized,\s*\{\s*signal\s*\}\)/,
+      /function resolveConnectTarget\(url, options\)[\s\S]{0,160}expandDatabricksWorkspaceUrl\(managedTarget \?\? normalizeUrl\(url\), options\)/,
+    );
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:set-server-url"[\s\S]{0,1200}await resolveConnectTarget\(url, \{ signal \}\)/,
     );
   });
 
@@ -1132,6 +1303,21 @@ describe("recent-server startup wiring (src/main.js)", () => {
       /ipcMain\.handle\("omnigent:get-recent-servers"[\s\S]{0,400}excludingManagedServers\(\s*normalizeRecentServers\(loadSettings\(\)\.recent_servers\),\s*managed/,
     );
   });
+
+  it("counts MDM presets toward the setup page's returning-user signal", () => {
+    // Raw recents, NOT managed-excluded: a preset-only history is still returning.
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:get-setup-capabilities"[\s\S]{0,400}connectedBefore:\s*normalizeRecentServers\(loadSettings\(\)\.recent_servers\)\.length > 0/,
+    );
+  });
+
+  it("reports the local server as running only when start-local would reuse it", () => {
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:get-cli-status"[\s\S]{0,900}localServerRunning:\s*\(await omnigentCli\.localServerHealthy\(\)\) !== null/,
+    );
+  });
 });
 
 // Guard for the deep-link path join in createWindow. A basename-less SPA path
@@ -1423,4 +1609,92 @@ describe("browser-view teardown on server change (src/main.js)", () => {
       ].join(" "),
     );
   });
+});
+
+describe("onboarding runner IPC", () => {
+  const server = "https://host.example/ml/omnigents";
+  const setupFrame = (h) => ({ url: `file://${h.api.SETUP_PAGE}` });
+  // main.js runs in its own VM context: compare its values structurally, and
+  // match its errors by name (their classes differ from this realm's).
+  const plain = (value) => JSON.parse(JSON.stringify(value));
+  const typeError = { name: "TypeError" };
+  // A setup-page sender that can be closed mid-request.
+  function setupSender() {
+    let destroyed = false;
+    return {
+      send() {},
+      once() {},
+      removeListener() {},
+      isDestroyed: () => destroyed,
+      destroy: () => {
+        destroyed = true;
+      },
+    };
+  }
+  function harness(t, options) {
+    const h = loadNavigationHarness({ serverUrl: server, ...options });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    return h;
+  }
+
+  it("serves only the setup page, and rejects bad input", async (t) => {
+    const h = harness(t);
+    const connect = h.ipc.get("omnigent:connect-runner");
+    const sender = setupSender();
+    await assert.rejects(
+      connect({ sender, senderFrame: { url: server } }, server, "local"),
+      /only available to the setup page/,
+    );
+    await assert.rejects(
+      connect({ sender, senderFrame: setupFrame(h) }, server, "sandbox"),
+      typeError,
+    );
+    await assert.rejects(connect({ sender, senderFrame: setupFrame(h) }, 42, "local"), typeError);
+    assert.throws(
+      () => h.ipc.get("omnigent:get-runner-options")({ senderFrame: { url: server } }, server),
+      /only available to the setup page/,
+    );
+  });
+
+  it("offers no remote environment without the internal flag, and refuses to connect one", async (t) => {
+    const h = harness(t);
+    const event = { sender: setupSender(), senderFrame: setupFrame(h) };
+    assert.deepEqual(plain(h.ipc.get("omnigent:get-runner-options")(event, server)), {
+      remote: false,
+      bundledCli: false,
+    });
+    const result = await h.ipc.get("omnigent:connect-runner")(event, server, "remote");
+    assert.equal(result.ok, false);
+    assert.match(result.error, /isn't available/);
+  });
+
+  it("names the missing launcher when this laptop has no host CLI", async (t) => {
+    const h = harness(t);
+    const event = { sender: setupSender(), senderFrame: setupFrame(h) };
+    const result = await h.ipc.get("omnigent:connect-runner")(event, server, "local");
+    assert.equal(result.ok, false);
+    assert.match(result.error, /omnigent CLI was not found/);
+  });
+
+  for (const runner of ["local", "remote"]) {
+    it(`starts nothing for a ${runner} runner once setup closes during URL resolution`, async (t) => {
+      let resolveTarget;
+      const h = harness(t, {
+        expandWorkspace: () =>
+          new Promise((resolve) => {
+            resolveTarget = resolve;
+          }),
+      });
+      const sender = setupSender();
+      const pending = h.ipc.get("omnigent:connect-runner")(
+        { sender, senderFrame: setupFrame(h) },
+        server,
+        runner,
+      );
+      sender.destroy();
+      resolveTarget(server);
+      assert.deepEqual(plain(await pending), { ok: false, canceled: true });
+    });
+  }
 });
